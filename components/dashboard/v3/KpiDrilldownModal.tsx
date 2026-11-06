@@ -1,0 +1,916 @@
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import * as DialogPrimitive from "@radix-ui/react-dialog";
+import {
+  Building2,
+  CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
+  Circle,
+  CircleDollarSign,
+  FileText,
+  Loader2,
+  ReceiptText,
+  Search,
+  UserCheck,
+  Users,
+  Wrench,
+  X,
+  Zap
+} from "lucide-react";
+import {
+  fetchPerformanceDetail,
+  fetchPerformanceDrilldown,
+  fetchPerformanceOptionStats,
+  type PerformanceCardType,
+  type PerformanceDetailData,
+  type PerformanceDocument,
+  type PerformanceDrilldownItem,
+  type PerformanceJobType,
+  type PerformanceOptionStat,
+  type PerformanceOptionStatsData,
+  type PerformancePeriod,
+  type PerformancePersonSearchResult,
+  type PerformancePersonRole,
+  type PerformanceSlaRole,
+  type PerformanceTableMetric
+} from "@/lib/api/performance-v3";
+import { KpiDetailSections } from "./kpi-detail-sections";
+import { KpiTimeline } from "./kpi-timeline";
+import { formatNumberKpi, formatRupiahKpi, formatSignedDays } from "./kpi-formatters";
+import { cn } from "@/lib/utils";
+
+interface KpiDrilldownModalProps {
+  isOpen: boolean;
+  onClose: () => void;
+  kpiType: PerformanceCardType | null;
+  kpiTitle: string;
+  actorRole: string;
+  actorName: string;
+  actorCabang: string;
+  cabangFilter: string;
+  coordinatorFilter: string;
+  supportFilter: string;
+  period: PerformancePeriod;
+  jobType: PerformanceJobType;
+  search: string;
+  supportMetric?: PerformanceTableMetric;
+  availableCoordinators?: string[];
+  availableSupports?: string[];
+  approvalActors?: Record<PerformanceSlaRole, string[]>;
+  globalSearchResults?: PerformancePersonSearchResult[];
+}
+
+type DrilldownStep = "search_results" | "select_role" | "select_doc" | "select_name" | "list_ulok" | "select_scope";
+
+const roleOptions: Array<{ id: PerformanceSlaRole | PerformancePersonRole; label: string; icon: React.ElementType; tone: string; accentBorder: string; accentBg: string }> = [
+  { id: "branch_manager", label: "Branch Manager", icon: Building2, tone: "text-cyan-700 bg-cyan-50 border-cyan-200", accentBorder: "border-l-cyan-500", accentBg: "hover:bg-cyan-50/20 hover:border-r-cyan-200 hover:border-y-cyan-200" },
+  { id: "bm_manager", label: "B&M Manager", icon: Users, tone: "text-indigo-700 bg-indigo-50 border-indigo-200", accentBorder: "border-l-indigo-500", accentBg: "hover:bg-indigo-50/20 hover:border-r-indigo-200 hover:border-y-indigo-200" },
+  { id: "coordinator", label: "Branch Building Coordinator", icon: UserCheck, tone: "text-sky-700 bg-sky-50 border-sky-200", accentBorder: "border-l-sky-500", accentBg: "hover:bg-sky-50/20 hover:border-r-sky-200 hover:border-y-sky-200" },
+  { id: "support", label: "Branch Building Support", icon: Wrench, tone: "text-emerald-700 bg-emerald-50 border-emerald-200", accentBorder: "border-l-emerald-500", accentBg: "hover:bg-emerald-50/20 hover:border-r-emerald-200 hover:border-y-emerald-200" }
+];
+
+const docOptions: Array<{ id: PerformanceDocument; label: string; roles: PerformanceSlaRole[]; icon: React.ElementType }> = [
+  { id: "rab", label: "RAB", roles: ["coordinator", "bm_manager"], icon: ReceiptText },
+  { id: "spk", label: "SPK", roles: ["branch_manager"], icon: FileText },
+  { id: "tambah_spk", label: "Tambah SPK", roles: ["branch_manager"], icon: FileText },
+  { id: "il", label: "Instruksi Lapangan", roles: ["coordinator", "bm_manager"], icon: FileText },
+  { id: "ktk", label: "KTK / Opname Final", roles: ["support", "coordinator", "bm_manager"], icon: CircleDollarSign }
+];
+
+const roleLabel = (role?: string | null) => roleOptions.find((item) => item.id === role)?.label ?? "-";
+const statLabel = (stat: PerformanceOptionStat | undefined, kpiType: PerformanceCardType | null) => {
+  if (stat?.value === null || stat?.value === undefined) return "-";
+  if (kpiType === "cost_m2" || kpiType === "kerja_tambah" || kpiType === "kerja_kurang" || kpiType === "denda") {
+    return formatRupiahKpi(stat.value);
+  }
+  return formatNumberKpi(stat.value, " hari");
+};
+const mergeStats = (items: PerformanceOptionStat[]): PerformanceOptionStat | undefined => {
+  const count = items.reduce((sum, item) => sum + item.count, 0);
+  if (!items.length) return undefined;
+
+  const validItems = items.filter((item) => item.value !== null && item.value !== undefined && item.count > 0);
+  const weight = validItems.reduce((sum, item) => sum + item.count, 0);
+  const value = weight > 0 ? validItems.reduce((sum, item) => sum + (item.value ?? 0) * item.count, 0) / weight : null;
+
+  const validBangunan = items.filter((item) => item.bangunan !== null && item.bangunan !== undefined && item.count > 0);
+  const weightBangunan = validBangunan.reduce((sum, item) => sum + item.count, 0);
+  const bangunan = weightBangunan > 0 ? validBangunan.reduce((sum, item) => sum + (item.bangunan ?? 0) * item.count, 0) / weightBangunan : undefined;
+
+  const validArea = items.filter((item) => item.area_terbuka !== null && item.area_terbuka !== undefined && item.count > 0);
+  const weightArea = validArea.reduce((sum, item) => sum + item.count, 0);
+  const area_terbuka = weightArea > 0 ? validArea.reduce((sum, item) => sum + (item.area_terbuka ?? 0) * item.count, 0) / weightArea : undefined;
+
+  return { 
+    id: "all", 
+    label: "Semua", 
+    value, 
+    count, 
+    bangunan, 
+    area_terbuka, 
+    incomplete_count: items.reduce((sum, item) => sum + (item.incomplete_count ?? 0), 0) 
+  };
+};
+const isAllValue = (value?: string | null) => !value || value.toUpperCase() === "ALL" || value.toUpperCase() === "SEMUA" || value.toUpperCase() === "SEMUA CABANG";
+
+export function KpiDrilldownModal({
+  isOpen,
+  onClose,
+  kpiType,
+  kpiTitle,
+  actorRole,
+  actorName,
+  actorCabang,
+  cabangFilter,
+  coordinatorFilter,
+  supportFilter,
+  period,
+  jobType,
+  search,
+  supportMetric,
+  availableCoordinators = [],
+  availableSupports = [],
+  approvalActors,
+  globalSearchResults
+}: KpiDrilldownModalProps) {
+  const [step, setStep] = useState<DrilldownStep>("select_role");
+  const [selectedRole, setSelectedRole] = useState<PerformanceSlaRole | PerformancePersonRole | null>(null);
+  const [selectedDoc, setSelectedDoc] = useState<PerformanceDocument | null>(null);
+  const [selectedName, setSelectedName] = useState<string | null>(null);
+  const [personSearch, setPersonSearch] = useState("");
+  const [listSearch, setListSearch] = useState("");
+  const [rows, setRows] = useState<PerformanceDrilldownItem[]>([]);
+  const [meta, setMeta] = useState<{ total: number; page: number; limit: number; totalPages: number } | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedUlok, setSelectedUlok] = useState<PerformanceDrilldownItem | null>(null);
+  const [scopeSelectionRow, setScopeSelectionRow] = useState<PerformanceDrilldownItem | null>(null);
+  const [detail, setDetail] = useState<PerformanceDetailData | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [optionStats, setOptionStats] = useState<PerformanceOptionStatsData>({ roles: [], people: [], documents: [] });
+  const [optionStatsLoading, setOptionStatsLoading] = useState(false);
+
+  const normalizedActor = actorRole.toUpperCase();
+  const isSupportUser = normalizedActor.includes("SUPPORT") || normalizedActor.includes("PENGAWAS");
+  const isCoordinatorUser = normalizedActor.includes("KOORDINATOR") || normalizedActor.includes("COORD");
+  const supportPersonName = !isAllValue(supportFilter) ? supportFilter : actorName;
+  const coordinatorPersonName = !isAllValue(coordinatorFilter) ? coordinatorFilter : actorName;
+
+  useEffect(() => {
+    if (!isOpen || !kpiType) return;
+    setRows([]);
+    setMeta(null);
+    setError(null);
+    setSelectedUlok(null);
+    setScopeSelectionRow(null);
+    setDetail(null);
+    setSelectedDoc(null);
+    setSelectedName(null);
+    setPersonSearch("");
+    setListSearch("");
+
+    if (kpiType === "all") {
+      setStep("search_results");
+      return;
+    }
+
+    if (supportMetric) {
+      setSelectedRole("support");
+      setSelectedName(!isAllValue(supportFilter) ? supportFilter : null);
+      setStep("list_ulok");
+      return;
+    }
+
+    if (isSupportUser) {
+      setSelectedRole("support");
+      setSelectedName(supportPersonName || null);
+      if (kpiType === "sla_approval") setSelectedDoc("ktk");
+      setStep("list_ulok");
+      return;
+    }
+
+    if (isCoordinatorUser) {
+      if (kpiType === "sla_approval") {
+        setSelectedRole("coordinator");
+        setSelectedName(coordinatorPersonName || null);
+        setStep("select_doc");
+        return;
+      }
+      setSelectedRole("support");
+      setStep("select_name");
+      return;
+    }
+
+    if (kpiType === "ketepatan_st" || kpiType === "sla_ktk") {
+      setSelectedRole("support");
+      setStep("select_name");
+      return;
+    }
+
+    setStep("select_role");
+  }, [actorName, actorCabang, actorRole, coordinatorPersonName, isCoordinatorUser, isOpen, isSupportUser, kpiType, supportFilter, supportMetric, supportPersonName]);
+
+  const allowedRoles = useMemo(() => {
+    if (!kpiType) return [];
+    if (isSupportUser) return roleOptions.filter((role) => role.id === "support");
+    if (isCoordinatorUser) return kpiType === "sla_approval"
+      ? roleOptions.filter((role) => role.id === "coordinator")
+      : roleOptions.filter((role) => role.id === "support");
+    if (kpiType === "sla_approval") return roleOptions.filter((role) => role.id !== "support");
+    if (kpiType === "ketepatan_st" || kpiType === "sla_ktk") return roleOptions.filter((role) => role.id === "support");
+    return roleOptions.filter((role) => role.id === "coordinator" || role.id === "support");
+  }, [isCoordinatorUser, isSupportUser, kpiType]);
+
+
+  const statById = useCallback((items: PerformanceOptionStat[], id?: string | null) => items.find((item) => item.id === id || item.label === id), []);
+  const allPeopleStat = useMemo(() => mergeStats(optionStats.people), [optionStats.people]);
+
+  const renderOptionStat = (stat?: PerformanceOptionStat, alignLeft = true) => {
+    if (kpiType === "cost_m2") {
+      return (
+        <div className="mt-4 flex w-full flex-col">
+          <div className="mb-4 text-left">
+            <div className="text-[10px] font-extrabold uppercase tracking-widest text-slate-400">Total Cost / m² (Terbangun)</div>
+            <div className="mt-1 text-2xl font-black tracking-tight text-slate-900">{optionStatsLoading ? "..." : formatRupiahKpi(stat?.value)}</div>
+          </div>
+          <div className="grid grid-cols-2 gap-3 rounded-xl bg-slate-50/80 p-3 ring-1 ring-slate-100/80">
+            <div className="flex flex-col text-left">
+              <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">Bangunan</span>
+              <span className="mt-0.5 text-xs font-bold text-slate-800">{optionStatsLoading ? "..." : formatRupiahKpi(stat?.bangunan)}</span>
+            </div>
+            <div className="flex flex-col text-left">
+              <span className="text-[9px] font-bold uppercase tracking-widest text-slate-500">Area Terbuka</span>
+              <span className="mt-0.5 text-xs font-bold text-slate-800">{optionStatsLoading ? "..." : formatRupiahKpi(stat?.area_terbuka)}</span>
+            </div>
+          </div>
+          <div className={cn("mt-4 text-[10px] font-bold text-slate-400", alignLeft ? "text-left" : "text-center")}>
+            Berdasarkan {optionStatsLoading ? "..." : stat?.count ?? 0} data
+          </div>
+        </div>
+      );
+    }
+    return (
+      <div className={cn("mt-4 flex flex-col gap-1", alignLeft ? "text-left" : "text-center")}>
+        <div className="flex items-baseline gap-2">
+          <span className="text-2xl font-bold tracking-tight text-slate-900">
+            {optionStatsLoading ? "..." : statLabel(stat, kpiType)}
+          </span>
+        </div>
+        <span className="text-[11px] font-semibold text-slate-500">
+          Rata-rata dari {optionStatsLoading ? "..." : stat?.count ?? 0} data
+        </span>
+      </div>
+    );
+  };
+
+  useEffect(() => {
+    if (!isOpen || !kpiType) return;
+    let ignore = false;
+    async function loadOptionStats() {
+      setOptionStatsLoading(true);
+      try {
+        const res = await fetchPerformanceOptionStats({
+          actor_role: actorRole || "USER",
+          actor_cabang: actorCabang,
+          cabang: cabangFilter,
+          coordinator: coordinatorFilter,
+          support: supportFilter,
+          job_type: jobType,
+          period,
+          search,
+          card_type: kpiType as PerformanceCardType,
+          selected_role: selectedRole ?? undefined,
+          selected_name: selectedName ?? undefined
+        });
+        if (!ignore) setOptionStats(res.data || { roles: [], people: [], documents: [] });
+      } catch {
+        if (!ignore) setOptionStats({ roles: [], people: [], documents: [] });
+      } finally {
+        if (!ignore) setOptionStatsLoading(false);
+      }
+    }
+    loadOptionStats();
+    return () => { ignore = true; };
+  }, [actorCabang, actorRole, cabangFilter, coordinatorFilter, jobType, isOpen, kpiType, period, search, selectedName, selectedRole, supportFilter]);
+  const loadRows = useCallback(async (page = 1) => {
+    if (!kpiType) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await fetchPerformanceDrilldown({
+        actor_role: actorRole || "USER",
+        actor_cabang: actorCabang,
+        cabang: cabangFilter,
+        coordinator: coordinatorFilter,
+        support: supportFilter,
+        job_type: jobType,
+        period,
+        search: listSearch || search,
+        card_type: kpiType as PerformanceCardType,
+        sla_role: kpiType === "sla_approval" ? selectedRole as PerformanceSlaRole : undefined,
+        sla_doc: selectedDoc ?? undefined,
+        person_role: kpiType !== "sla_approval" ? selectedRole as PerformancePersonRole : undefined,
+        person_name: selectedName ?? undefined,
+        support_metric: supportMetric,
+        page,
+        limit: 25
+      });
+      setRows(res.data || []);
+      setMeta(res.meta);
+    } catch (err: unknown) {
+      setError(err instanceof Error ? err.message : "Gagal memuat list ULOK.");
+    } finally {
+      setLoading(false);
+    }
+  }, [actorCabang, actorRole, cabangFilter, coordinatorFilter, jobType, kpiType, period, search, listSearch, selectedDoc, selectedName, selectedRole, supportFilter, supportMetric]);
+
+  useEffect(() => { if (isOpen && step === "list_ulok") loadRows(1); }, [isOpen, step, loadRows]);
+
+  const openDetail = async (row: PerformanceDrilldownItem, lingkup?: string) => {
+    if (!kpiType) return;
+    setSelectedUlok(row);
+    setDetail(null);
+    setDetailLoading(true);
+    try {
+      const res = await fetchPerformanceDetail({
+        actor_role: actorRole || "USER",
+        actor_cabang: actorCabang,
+        cabang: cabangFilter,
+        coordinator: coordinatorFilter,
+        support: supportFilter,
+        job_type: jobType,
+        period,
+        search,
+        nomor_ulok: row.nomor_ulok,
+        lingkup_pekerjaan: lingkup,
+        card_type: kpiType as PerformanceCardType,
+        sla_role: kpiType === "sla_approval" ? selectedRole as PerformanceSlaRole : undefined,
+        sla_doc: selectedDoc ?? undefined,
+        person_role: kpiType !== "sla_approval" ? selectedRole as PerformancePersonRole : undefined,
+        person_name: selectedName ?? undefined,
+        support_metric: supportMetric
+      });
+      setDetail(res.data);
+    } catch {
+      setDetail(null);
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  const goBack = () => {
+    if (step === "select_scope") {
+      setScopeSelectionRow(null);
+      setStep("list_ulok");
+      return;
+    }
+    if (step === "list_ulok") {
+      if (kpiType === "all") {
+        setStep("search_results");
+        return;
+      }
+      if (supportMetric) return onClose();
+      setStep(kpiType === "sla_approval" ? "select_doc" : "select_name");
+      return;
+    }
+    if (step === "select_doc") {
+      setStep(kpiType === "sla_approval" ? "select_name" : "select_role");
+      return;
+    }
+    if (step === "select_name") {
+      setStep("select_role");
+      return;
+    }
+  };
+
+  const renderRole = () => (
+    <div className="flex flex-col items-center justify-center p-6 sm:p-10 lg:p-12">
+      <div className={cn("mb-10 w-full text-left", allowedRoles.length === 3 ? "max-w-4xl" : "max-w-2xl")}>
+        <h3 className="text-2xl font-bold tracking-tight text-slate-900">Pilih Role KPI</h3>
+        <p className="mt-2 text-sm font-medium text-slate-500">Pilih peran mana yang ingin Anda evaluasi performanya.</p>
+      </div>
+      <div className={cn("grid w-full gap-5", allowedRoles.length === 3 ? "max-w-4xl grid-cols-1 sm:grid-cols-3" : "max-w-2xl grid-cols-1 sm:grid-cols-2")}>
+        {allowedRoles.map((role) => {
+          const Icon = role.icon;
+          return (
+            <button 
+              key={role.id} 
+              type="button" 
+              onClick={() => { setSelectedRole(role.id); setStep("select_name"); }} 
+              className={cn(
+                "group flex flex-col items-start rounded-2xl border-y border-r border-l-[6px] border-y-slate-200/70 border-r-slate-200/70 bg-white p-5 text-left transition-all duration-300 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400",
+                role.accentBorder,
+                role.accentBg
+              )}
+            >
+              <div className="flex items-center gap-3">
+                <div className={cn("flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition-colors", role.tone)}>
+                  <Icon className="h-5 w-5" aria-hidden="true" />
+                </div>
+                <span className="text-sm font-bold leading-tight text-slate-900">{role.label}</span>
+              </div>
+              <div className="mt-2 w-full">
+                {renderOptionStat(statById(optionStats.roles, role.id), true)}
+              </div>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+
+  const renderDoc = () => {
+    const docs = docOptions.filter((doc) => selectedRole && doc.roles.includes(selectedRole as PerformanceSlaRole));
+    return (
+      <div className="flex flex-col h-full bg-slate-50/50">
+        <div className="shrink-0 p-6 sm:px-10 lg:px-12 pt-10 pb-6 text-left">
+          <h3 className="text-2xl font-bold tracking-tight text-slate-900">Pilih Dokumen</h3>
+          <p className="mt-1.5 text-sm font-medium text-slate-500">Evaluasi SLA untuk {roleLabel(selectedRole)}</p>
+        </div>
+        <div className="flex-1 overflow-y-auto p-6 sm:px-10 lg:px-12 pt-2 custom-scrollbar">
+          <div className="grid w-full max-w-4xl grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            {docs.map((doc) => {
+              const Icon = doc.icon;
+              return (
+                <button
+                  key={doc.id}
+                  type="button"
+                  onClick={() => { setSelectedDoc(doc.id); setStep("list_ulok"); }}
+                  className="group flex flex-col items-start rounded-2xl border border-slate-200/70 bg-white p-6 text-left transition-all duration-200 hover:border-slate-300 hover:bg-slate-50 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-red-50 text-red-600 transition-colors group-hover:bg-red-100">
+                      <Icon className="h-5 w-5" aria-hidden="true" />
+                    </div>
+                    <span className="text-sm font-bold leading-tight text-slate-900">{doc.label}</span>
+                  </div>
+                  <div className="mt-4 w-full">
+                    {renderOptionStat(statById(optionStats.documents, doc.id), true)}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderName = () => {
+    let names: string[] = [];
+    if (kpiType === "sla_approval") {
+      names = approvalActors?.[selectedRole as PerformanceSlaRole] || [];
+    } else {
+      names = Array.from(new Set((selectedRole === "coordinator" ? availableCoordinators : availableSupports).filter(Boolean)));
+    }
+
+    const filteredNames = names.filter(n => n.toLowerCase().includes(personSearch.toLowerCase()));
+
+    const getInitials = (name: string) => {
+      if (!name || name === "Semua Personil") return "All";
+      const parts = name.trim().split(" ");
+      if (parts.length === 1) return parts[0].substring(0, 2).toUpperCase();
+      return (parts[0][0] + parts[1][0]).toUpperCase();
+    };
+
+    const renderPersonRow = (name: string, isAll = false) => {
+      const stat = isAll ? allPeopleStat : statById(optionStats.people, name);
+      const valStr = statLabel(stat, kpiType);
+      
+      return (
+        <button 
+          key={name} 
+          type="button" 
+          onClick={() => { setSelectedName(isAll ? null : name); setStep(kpiType === "sla_approval" ? "select_doc" : "list_ulok"); }} 
+          className="group flex w-full items-center justify-between rounded-xl border border-slate-200/70 bg-white p-4 transition-all duration-200 hover:border-slate-300 hover:bg-slate-50 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+        >
+          <div className="flex min-w-0 flex-1 items-center gap-4">
+            <div className={cn("flex h-10 w-10 shrink-0 items-center justify-center rounded-full text-xs font-bold transition-colors", isAll ? "bg-slate-800 text-white group-hover:bg-blue-600" : "bg-slate-100 text-slate-600 group-hover:bg-blue-100 group-hover:text-blue-700")}>
+              {isAll ? <Users className="h-4 w-4" /> : getInitials(name)}
+            </div>
+            <div className="flex min-w-0 flex-1 flex-col text-left pr-4">
+              <span className="truncate text-sm font-bold text-slate-900 group-hover:text-blue-700">{name}</span>
+              <span className="truncate text-[11px] font-medium text-slate-500">
+                {stat?.count ?? 0} Data
+              </span>
+            </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-3">
+            <div className="flex flex-col text-right">
+              <span className="text-sm font-bold text-slate-900">{optionStatsLoading ? "..." : valStr}</span>
+              <span className="text-[9px] font-bold uppercase tracking-widest text-slate-400">Rata-rata</span>
+            </div>
+            <ChevronRight className="h-4 w-4 shrink-0 text-slate-300 group-hover:text-blue-500" aria-hidden="true" />
+          </div>
+        </button>
+      );
+    };
+
+    return (
+      <div className="flex flex-col h-full overflow-hidden bg-slate-50/50">
+        <div className="shrink-0 p-6 sm:px-10 lg:px-12 pt-8 pb-4">
+          <h3 className="text-2xl font-bold tracking-tight text-slate-900">Pilih Personil</h3>
+          <p className="mt-1.5 text-sm font-medium text-slate-500">Pilih spesifik personil {roleLabel(selectedRole)}</p>
+          
+          <div className="mt-6 relative max-w-md">
+            <Search className="pointer-events-none absolute left-3.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Cari nama personil..."
+              value={personSearch}
+              onChange={(e) => setPersonSearch(e.target.value)}
+              className="block w-full rounded-xl border border-slate-200/70 bg-white py-2.5 pl-10 pr-4 text-sm font-medium text-slate-900 placeholder:text-slate-400 focus:border-slate-400 focus:outline-none focus:ring-1 focus:ring-slate-400 transition-colors"
+            />
+          </div>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-6 sm:px-10 lg:px-12 pt-2 pb-10 custom-scrollbar">
+          <div className="grid w-full max-w-4xl grid-cols-1 gap-3 lg:grid-cols-2">
+            {!personSearch && renderPersonRow("Semua Personil", true)}
+            {filteredNames.map(name => renderPersonRow(name))}
+            
+            {filteredNames.length === 0 && personSearch && (
+              <div className="col-span-full py-10 text-center text-sm font-medium text-slate-500">
+                Tidak ada personil yang cocok dengan pencarian "{personSearch}"
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderSearchResults = () => {
+    return (
+      <div className="flex flex-1 flex-col min-h-0 overflow-hidden bg-slate-50">
+        <div className="flex-1 overflow-y-auto p-5">
+          <div className="overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm">
+            <table className="w-full text-left text-sm">
+              <thead className="bg-slate-50 text-xs font-bold uppercase tracking-normal text-slate-500">
+                <tr>
+                  <th className="px-4 py-3">Nama Personil</th>
+                  <th className="px-4 py-3">Role</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {globalSearchResults?.map((result, idx) => (
+                  <tr 
+                    key={idx} 
+                    onClick={() => { setSelectedRole(result.roleId); setSelectedName(result.name); setStep("list_ulok"); }}
+                    className="group cursor-pointer hover:bg-red-50/50 transition-colors"
+                  >
+                    <td className="px-4 py-3 font-bold text-slate-950 underline-offset-4 group-hover:text-red-700 group-hover:underline">
+                      {result.name}
+                    </td>
+                    <td className="px-4 py-3 font-semibold text-slate-500">
+                      <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs">
+                        {result.role}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+                {(!globalSearchResults || globalSearchResults.length === 0) && (
+                  <tr>
+                    <td colSpan={2} className="px-4 py-10 text-center text-sm font-semibold text-slate-500">
+                      Personil tidak ditemukan.
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderScopeSelection = () => {
+    const row = scopeSelectionRow;
+    const rawScopes = row?.scopes?.length ? row.scopes : [{ lingkup_pekerjaan: "LAINNYA", toko_id: 0 }];
+    const scopes = [...rawScopes].sort((a, b) => {
+      const aName = a.lingkup_pekerjaan?.toUpperCase() || "";
+      const bName = b.lingkup_pekerjaan?.toUpperCase() || "";
+      if (aName === "SIPIL" && bName !== "SIPIL") return -1;
+      if (bName === "SIPIL" && aName !== "SIPIL") return 1;
+      return aName.localeCompare(bName);
+    });
+
+    return (
+      <div className="flex flex-col h-full bg-slate-50/50">
+        <div className="shrink-0 p-6 sm:px-10 lg:px-12 pt-10 pb-6 text-left">
+          <h3 className="text-2xl font-bold tracking-tight text-slate-900">Pilih Lingkup Pekerjaan</h3>
+          <p className="mt-1.5 text-sm font-medium text-slate-500">{row?.nomor_ulok} - {row?.nama_toko ?? "-"}</p>
+        </div>
+        <div className="flex-1 overflow-y-auto p-6 sm:px-10 lg:px-12 pt-2 custom-scrollbar">
+          <div className="grid w-full max-w-4xl grid-cols-1 gap-4 sm:grid-cols-2">
+            {scopes.map((scope) => {
+              const statusItems = [
+                { label: "RAB", active: scope.has_rab },
+                { label: "SPK", active: scope.has_spk },
+                { label: "ST", active: scope.has_st },
+                { label: "KTK", active: scope.has_opname }
+              ];
+              
+              const isSipil = scope.lingkup_pekerjaan?.toUpperCase() === "SIPIL";
+              const isMe = scope.lingkup_pekerjaan?.toUpperCase() === "ME";
+              
+              return (
+                <button
+                  key={(row?.nomor_ulok ?? "ULOK") + "-" + scope.lingkup_pekerjaan}
+                  type="button"
+                  onClick={() => row && openDetail(row, scope.lingkup_pekerjaan)}
+                  className="group relative flex flex-col justify-between overflow-hidden rounded-2xl border border-slate-200/70 bg-white p-6 text-left transition-all duration-300 hover:border-slate-300 hover:shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+                >
+                  <div className={cn("absolute left-0 top-0 bottom-0 w-1.5 transition-colors", isSipil ? "bg-blue-500 group-hover:bg-blue-600" : isMe ? "bg-amber-500 group-hover:bg-amber-600" : "bg-slate-400 group-hover:bg-slate-500")} />
+                  
+                  <div className="flex items-start justify-between gap-4 pl-2">
+                    <div className="flex items-center gap-3">
+                      <div className={cn("flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition-colors", 
+                        isSipil ? "bg-blue-50 text-blue-600 group-hover:bg-blue-100" : 
+                        isMe ? "bg-amber-50 text-amber-600 group-hover:bg-amber-100" : 
+                        "bg-slate-100 text-slate-600 group-hover:bg-slate-200"
+                      )}>
+                        {isSipil ? <Building2 className="h-5 w-5" /> : isMe ? <Zap className="h-5 w-5" /> : <FileText className="h-5 w-5" />}
+                      </div>
+                      <div className="flex flex-col">
+                        <span className="text-lg font-bold tracking-tight text-slate-900">{scope.lingkup_pekerjaan}</span>
+                        <span className="text-[10px] font-bold uppercase tracking-widest text-slate-400">{scope.project_type ?? "PROJECT"}</span>
+                      </div>
+                    </div>
+                    <ChevronRight className="h-5 w-5 shrink-0 text-slate-300 transition-transform group-hover:translate-x-1 group-hover:text-slate-600" aria-hidden="true" />
+                  </div>
+
+                  <div className="mt-8 flex items-center gap-1.5 pl-2">
+                    {statusItems.map((item, idx) => (
+                      <React.Fragment key={item.label}>
+                        <div className={cn("flex items-center gap-1.5 transition-colors", 
+                          item.active ? "text-slate-900" : "text-slate-300"
+                        )}>
+                          {item.active ? (
+                            <CheckCircle2 className={cn("h-4 w-4", isSipil ? "text-blue-500" : isMe ? "text-amber-500" : "text-slate-500")} />
+                          ) : (
+                            <Circle className="h-3.5 w-3.5 opacity-60" />
+                          )}
+                          <span className={cn("text-[10px] uppercase tracking-wider", item.active ? "font-bold" : "font-medium")}>
+                            {item.label}
+                          </span>
+                        </div>
+                        {idx < statusItems.length - 1 && (
+                          <div className={cn("h-[2px] w-4 rounded-full", item.active && statusItems[idx+1].active ? (isSipil ? "bg-blue-200" : isMe ? "bg-amber-200" : "bg-slate-200") : "bg-slate-100")} />
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderList = () => {
+    const isCostM2 = kpiType === "cost_m2";
+    return (
+      <div className="flex flex-1 flex-col min-h-0 overflow-hidden bg-slate-50/50">
+        <div className="flex shrink-0 items-center justify-between border-b border-slate-200/60 bg-white px-6 py-4">
+          <div className="text-sm font-bold text-slate-800">
+            Daftar ULOK
+          </div>
+          <div className="relative w-64">
+            <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+            <input
+              type="text"
+              placeholder="Cari Toko / ULOK..."
+              value={listSearch}
+              onChange={(e) => setListSearch(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && loadRows(1)}
+              className="block w-full rounded-lg border border-slate-200 bg-slate-50 py-1.5 pl-9 pr-3 text-xs font-semibold text-slate-900 placeholder:text-slate-400 focus:border-slate-400 focus:bg-white focus:outline-none focus:ring-1 focus:ring-slate-400 transition-colors"
+            />
+          </div>
+        </div>
+        <div className="flex-1 overflow-y-auto p-5 custom-scrollbar">
+          {loading ? <div className="flex h-40 items-center justify-center"><Loader2 className="h-8 w-8 animate-spin text-slate-400" aria-hidden="true" /></div> : error ? <div className="rounded-lg border border-red-200 bg-red-50 p-4 text-sm font-bold text-red-700">{error}</div> : (
+            <div className="overflow-hidden rounded-xl border border-slate-200/80 bg-white shadow-sm">
+              <table className="w-full text-left text-sm">
+                <thead className="border-b border-slate-200/80 bg-slate-50/50 text-xs font-bold uppercase tracking-wider text-slate-500">
+                  <tr>
+                    <th className="px-4 py-3">ULOK</th>
+                    <th className="px-4 py-3">Cabang</th>
+                    <th className="px-4 py-3">PIC Terkait</th>
+                    {isCostM2 ? (
+                      <>
+                        <th className="px-4 py-3 text-right">Terbangun</th>
+                        <th className="px-4 py-3 text-right">Bangunan</th>
+                        <th className="px-4 py-3 text-right">Area Terbuka</th>
+                      </>
+                    ) : kpiType === "all" ? (
+                      <>
+                        <th className="px-4 py-3 text-right">Status Proyek</th>
+                      </>
+                    ) : (
+                      <>
+                        <th className="px-4 py-3 text-right">
+                          {kpiType === "denda" ? "Total Denda" :
+                           kpiType === "kerja_tambah" || kpiType === "kerja_kurang" ? "Total Rupiah" :
+                           kpiType === "jhk" ? "Durasi (Hari)" :
+                           kpiType === "ketepatan_st" ? "Ketepatan ST" :
+                           kpiType === "sla_ktk" ? "SLA KTK (Hari)" :
+                           kpiType === "sla_approval" ? "Rata-rata Hari" : "Nilai"}
+                        </th>
+                      </>
+                    )}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100/80">
+                  {rows.map((row) => (
+                    <tr 
+                      key={row.nomor_ulok} 
+                      onClick={() => { setScopeSelectionRow(row); setStep("select_scope"); }}
+                      className="group cursor-pointer hover:bg-slate-50/70 transition-colors"
+                    >
+                      <td className="px-4 py-4">
+                        <span className="min-w-0">
+                          <span className="block font-bold text-slate-900 underline-offset-4 group-hover:text-blue-700 group-hover:underline">{row.nomor_ulok}</span>
+                          <span className="block truncate text-xs font-semibold text-slate-500 mt-0.5">{row.nama_toko ?? "-"}</span>
+                          <span className="mt-2.5 flex flex-wrap gap-1.5">
+                            {(row.scopes?.length ? row.scopes : [{ lingkup_pekerjaan: "LAINNYA", toko_id: 0 }]).map((scope) => (
+                              <span key={row.nomor_ulok + "-" + scope.lingkup_pekerjaan} className="rounded-md bg-slate-100 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-slate-600 ring-1 ring-inset ring-slate-200/60">
+                                {scope.lingkup_pekerjaan}
+                              </span>
+                            ))}
+                          </span>
+                        </span>
+                      </td>
+                      <td className="px-4 py-4 font-bold tracking-wide text-slate-700">{row.cabang ?? "-"}</td>
+                      <td className="px-4 py-4 text-[11px] font-semibold text-slate-600">
+                        <div className="flex flex-col gap-1.5">
+                          <span className="block truncate"><span className="text-slate-400 font-medium">Support:</span> {row.supports.join(", ") || "-"}</span>
+                          <span className="block truncate"><span className="text-slate-400 font-medium">Koord:</span> {row.coordinators.join(", ") || "-"}</span>
+                        </div>
+                      </td>
+                      {isCostM2 ? (
+                        <>
+                          <td className="px-4 py-4 text-right font-black text-slate-900">{row.value !== null && row.value !== undefined ? formatRupiahKpi(row.value) : "-"}</td>
+                          <td className="px-4 py-4 text-right text-xs font-semibold text-slate-500">{row.bangunan !== null && row.bangunan !== undefined ? formatRupiahKpi(row.bangunan) : "-"}</td>
+                          <td className="px-4 py-4 text-right text-xs font-semibold text-slate-500">{row.area_terbuka !== null && row.area_terbuka !== undefined ? formatRupiahKpi(row.area_terbuka) : "-"}</td>
+                        </>
+                      ) : kpiType === "all" ? (
+                        <>
+                          <td className="px-4 py-3 text-right text-xs font-bold text-slate-700">
+                            {(() => {
+                              const scope = row.scopes?.length ? row.scopes[0] : null;
+                              if (!scope) return "-";
+                              if (scope.has_st) return "Selesai (ST)";
+                              if (scope.has_opname) return "Opname Final / KTK";
+                              if (scope.has_spk) return "SPK / Progress";
+                              if (scope.has_rab) return "RAB";
+                              return "Inisiasi";
+                            })()}
+                          </td>
+                        </>
+                      ) : (
+                        <>
+                          <td className="px-4 py-3 text-right font-bold text-slate-800">
+                            <span className={cn("rounded-full bg-slate-100 px-2.5 py-1 text-xs", kpiType === "ketepatan_st" && row.value !== null && row.value !== undefined && row.value < 0 ? "bg-emerald-50 text-emerald-700 ring-1 ring-emerald-200" : kpiType === "ketepatan_st" && row.value !== null && row.value !== undefined && row.value > 0 ? "bg-red-50 text-red-700 ring-1 ring-red-200" : "")}>
+                              {(() => {
+                                if (row.value === null || row.value === undefined) return "-";
+                                if (kpiType === "denda" || kpiType === "kerja_tambah" || kpiType === "kerja_kurang") return formatRupiahKpi(row.value);
+                                if (kpiType === "jhk" || kpiType === "sla_ktk" || kpiType === "sla_approval") return formatNumberKpi(row.value, " hari");
+                                if (kpiType === "ketepatan_st") return formatSignedDays(row.value).split(" / ")[0];
+                                return row.value_label;
+                              })()}
+                            </span>
+                          </td>
+                        </>
+                      )}
+                    </tr>
+                  ))}
+                  {!rows.length && <tr><td colSpan={isCostM2 ? 6 : 4} className="px-4 py-10 text-center text-sm font-semibold text-slate-500">Tidak ada ULOK untuk pilihan ini.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      {meta && meta.totalPages > 1 && (
+        <div className="flex shrink-0 items-center justify-between border-t border-slate-200 bg-white px-6 py-4 text-sm font-bold text-slate-600 shadow-[0_-4px_20px_rgb(0,0,0,0.02)] relative z-10">
+          <span>Page {meta.page} dari {meta.totalPages}</span>
+          <div className="flex gap-2">
+            <button type="button" disabled={meta.page <= 1} onClick={() => loadRows(meta.page - 1)} className="rounded-md border border-slate-200 bg-white px-4 py-1.5 text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-40 disabled:hover:bg-white">Prev</button>
+            <button type="button" disabled={meta.page >= meta.totalPages} onClick={() => loadRows(meta.page + 1)} className="rounded-md border border-slate-200 bg-white px-4 py-1.5 text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:opacity-40 disabled:hover:bg-white">Next</button>
+          </div>
+        </div>
+      )}
+    </div>
+    );
+  };
+
+  return (
+    <>
+      <Dialog open={isOpen} onOpenChange={(open) => !open && onClose()}>
+        <DialogContent className={cn(
+          "!flex flex-col gap-0 overflow-hidden border border-slate-200/60 bg-white p-0 shadow-2xl transition-all duration-300 sm:rounded-2xl max-h-[90dvh]",
+          step === "list_ulok" ? "w-[95vw] sm:max-w-5xl" : "w-[95vw] sm:max-w-3xl"
+        )}>
+          <DialogHeader className="relative z-10 flex shrink-0 flex-col justify-center border-b border-slate-200/60 bg-white px-6 py-5">
+            <div className="flex items-center gap-4">
+              {step !== "select_role" && (
+                <button
+                  type="button"
+                  aria-label="Kembali"
+                  onClick={goBack}
+                  className="group flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition-all hover:bg-slate-50 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+                >
+                  <ChevronLeft className="h-5 w-5 transition-transform group-hover:-translate-x-0.5" aria-hidden="true" />
+                </button>
+              )}
+              <div className="min-w-0 flex-1">
+                <DialogTitle className="truncate text-xl font-bold tracking-tight text-slate-900">{kpiTitle}</DialogTitle>
+                {selectedRole && (
+                  <p className="mt-1 flex items-center gap-2 text-[11px] font-bold uppercase tracking-widest text-slate-500">
+                    <span className="truncate">{roleLabel(selectedRole)} {selectedDoc ? `\u2022 ${selectedDoc.toUpperCase()}` : ""}</span>
+                  </p>
+                )}
+              </div>
+              <DialogPrimitive.Close className="group flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-slate-50 text-slate-400 transition-all hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500">
+                <X className="h-4 w-4 transition-transform group-hover:rotate-90" aria-hidden="true" />
+              </DialogPrimitive.Close>
+            </div>
+          </DialogHeader>
+          <div className="flex flex-1 flex-col min-h-0 overflow-hidden bg-transparent">
+            {step === "search_results" && renderSearchResults()}
+            {step === "select_role" && renderRole()}
+            {step === "select_doc" && renderDoc()}
+            {step === "select_name" && renderName()}
+            {step === "list_ulok" && renderList()}
+            {step === "select_scope" && renderScopeSelection()}
+          </div>
+        </DialogContent>
+      </Dialog>
+
+      {selectedUlok && (
+        <DialogPrimitive.Root open={!!selectedUlok} onOpenChange={(open) => !open && setSelectedUlok(null)}>
+          <DialogPrimitive.Portal>
+            <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 sm:p-6">
+              <DialogPrimitive.Overlay className="fixed inset-0 z-[100] bg-slate-900/50 backdrop-blur-sm transition-all duration-300 data-[state=closed]:opacity-0" />
+              <DialogPrimitive.Content
+                aria-describedby={undefined}
+                className="relative z-[110] flex w-full max-w-5xl max-h-[90vh] flex-col overflow-hidden rounded-2xl border border-slate-200/60 bg-[#f8fafc] shadow-2xl duration-300 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95 focus-visible:outline-none"
+              >
+                <header className="sticky top-0 z-10 shrink-0 border-b border-slate-200/50 bg-white/70 px-6 py-5 backdrop-blur-xl">
+                  <div className="flex items-start justify-between gap-4">
+                    <div className="flex items-start gap-4 flex-1 min-w-0">
+                      <button
+                        type="button"
+                        aria-label="Kembali"
+                        onClick={() => setSelectedUlok(null)}
+                        className="group mt-1.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-500 transition-all hover:bg-slate-50 hover:text-slate-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-400"
+                      >
+                        <ChevronLeft className="h-5 w-5 transition-transform group-hover:-translate-x-0.5" aria-hidden="true" />
+                      </button>
+                      <div className="min-w-0 flex-1">
+                        <p className="flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-red-600">
+                          <span className="flex h-1.5 w-1.5 rounded-full bg-red-600 animate-pulse" />
+                          Detail ULOK {selectedUlok.nomor_ulok}
+                        </p>
+                        <DialogPrimitive.Title className="mt-1.5 truncate text-2xl font-bold tracking-tight text-slate-900">
+                          {selectedUlok.nama_toko ?? selectedUlok.nomor_ulok}
+                        </DialogPrimitive.Title>
+                        {detail?.selected_scope && (
+                          <span className="mt-2 inline-flex rounded-full bg-red-50 px-3 py-1 text-[10px] font-extrabold uppercase tracking-widest text-red-700 ring-1 ring-red-100">
+                            Lingkup {detail.selected_scope}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+                    <DialogPrimitive.Close className="group rounded-full bg-slate-100 p-2.5 text-slate-500 transition-all hover:bg-red-50 hover:text-red-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500">
+                      <X className="h-5 w-5 transition-transform group-hover:rotate-90" aria-hidden="true" />
+                    </DialogPrimitive.Close>
+                  </div>
+                </header>
+                <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-6 custom-scrollbar bg-transparent">
+                  {detailLoading ? (
+                    <div className="flex h-64 items-center justify-center rounded-3xl border border-white bg-white/40 shadow-sm backdrop-blur-md">
+                      <Loader2 className="h-8 w-8 animate-spin text-red-600" aria-hidden="true" />
+                    </div>
+                  ) : detail ? (
+                    <div className="flex flex-col gap-6">
+                      <KpiDetailSections detail={detail} />
+                      <KpiTimeline nomor_ulok={detail.nomor_ulok} lingkup_pekerjaan={detail.selected_scope} />
+                    </div>
+                  ) : (
+                    <div className="rounded-2xl border border-red-200 bg-red-50/80 p-5 text-sm font-bold text-red-700 shadow-sm backdrop-blur-sm">
+                      Detail tidak bisa dimuat.
+                    </div>
+                  )}
+                </div>
+              </DialogPrimitive.Content>
+            </div>
+          </DialogPrimitive.Portal>
+        </DialogPrimitive.Root>
+      )}
+    </>
+  );
+}

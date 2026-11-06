@@ -1,0 +1,2448 @@
+"use client"
+
+import React, { Suspense, useState, useEffect, useMemo, useRef } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useSession } from '@/context/SessionContext';
+// Import AppNavbar
+import AppNavbar from '@/components/AppNavbar';
+import LoadingOverlay from '@/components/LoadingOverlay';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { Combobox, ComboboxInput, ComboboxContent, ComboboxEmpty, ComboboxList, ComboboxItem } from '@/components/ui/combobox';
+import { Checkbox } from '@/components/ui/checkbox';
+import {
+  AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent,
+  AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+
+import { Plus, Trash2, Save, Loader2, Info, AlertTriangle, Bell, Upload, X, Image as ImageIcon, Download, ClipboardList, ArrowRight } from 'lucide-react';
+import { DatePicker } from '@/components/ui/date-picker';
+
+import { SIPIL_CATEGORIES, ME_CATEGORIES, BRANCH_GROUPS, BRANCH_TO_ULOK, canViewAllBranches, getRabPriceBranch, isViewOnlyUser, SUPPORTED_PRICE_BRANCHES, getParentBranch } from '@/lib/constants';
+import {
+  checkRevisionStatus,
+  fetchPricesData,
+  submitRABData,
+  fetchRABList,
+  fetchRABDetail,
+  fetchTokoDetail,
+  getRABLogoDownloadUrl,
+  getRABInsuranceDownloadUrl,
+  fetchRabProjectPlanningPrefill,
+  fetchRabProjectPlanningRequests,
+  type RabProjectPlanningRequest,
+} from '@/lib/api';
+import { fetchDendaActions, type DendaAction } from '@/lib/denda-actions-api';
+import { fetchMaintenanceStores, type MaintenanceStore } from '@/lib/maintenance-api';
+
+const toRupiah = (num: number) => new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", minimumFractionDigits: 0 }).format(num || 0);
+const formatAngka = (num: number) => (num || num === 0) ? num.toLocaleString('id-ID') : '0';
+const blockedIncrementKeys = new Set(['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown']);
+const decimalFormFields = new Set(['luasBangunan', 'luasAreaTerbuka', 'luasAreaSales', 'luasGudang', 'luasAreaParkir']);
+
+const keepSingleDecimalSeparator = (value: string) => {
+  const normalized = value.replace(',', '.').replace(/[^\d.]/g, '');
+  const [head, ...tail] = normalized.split('.');
+  return tail.length > 0 ? `${head}.${tail.join('')}` : head;
+};
+
+const normalizeDecimalInput = (value: string) => keepSingleDecimalSeparator(value);
+const normalizeIntegerInput = (value: string) => value.replace(/[^\d]/g, '');
+const parseDecimalInput = (value: string) => {
+  const parsed = parseFloat(normalizeDecimalInput(value));
+  return Number.isFinite(parsed) ? parsed : 0;
+};
+const decimalPayloadValue = (value: string) => String(parseDecimalInput(value));
+
+const normalizeVolumeInput = (value: string) => {
+  const normalized = value.replace(/\./g, ',').replace(/[^\d,]/g, '');
+  const [head, ...tail] = normalized.split(',');
+  const cleanHead = head.replace(/^0+(?=\d)/, '');
+  return tail.length > 0 ? `${cleanHead || '0'},${tail.join('')}` : cleanHead;
+};
+
+const normalizeVolumeOnBlur = (value: string) => {
+  const normalized = normalizeVolumeInput(value);
+  if (!normalized) return '';
+  return normalized.endsWith(',') ? normalized.slice(0, -1) : normalized;
+};
+
+const volumeToNumber = (value: number | string | null | undefined) => {
+  const parsed = parseFloat(String(value ?? '').replace(',', '.'));
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+};
+
+const volumeToInputValue = (value: number | string | null | undefined) => {
+  if (value === null || value === undefined || value === '') return '';
+  return String(value).replace('.', ',');
+};
+
+const preventNativeNumberStep = (event: React.KeyboardEvent<HTMLElement>) => {
+  if (blockedIncrementKeys.has(event.key)) event.preventDefault();
+};
+
+const preventWheelNumberChange = (event: React.WheelEvent<HTMLElement>) => {
+  if (event.currentTarget === document.activeElement) event.preventDefault();
+};
+
+const preventSelectArrowChange = (event: React.KeyboardEvent<HTMLSelectElement>) => {
+  if (blockedIncrementKeys.has(event.key)) event.preventDefault();
+};
+
+const normalizeBranchName = (value?: string | null) =>
+  String(value ?? '').trim().toUpperCase().replace(/^CAB(?:ANG)?\.?\s+/, '').replace(/^CABANG\s+/, '').trim();
+
+const usesRabParentPrice = (branch?: string | null) => {
+  const priceBranch = getRabPriceBranch(branch);
+  return SUPPORTED_PRICE_BRANCHES.includes(priceBranch);
+};
+
+const normalizeJobName = (value?: string | null) =>
+  String(value ?? '').toLowerCase().replace(/\s+/g, ' ').replace(/[^\p{L}\p{N}\s]/gu, '').trim();
+
+const FUZZY_JOB_MATCH_THRESHOLD = 0.82;
+const FUZZY_JOB_MATCH_MARGIN = 0.06;
+const JOB_MATCH_STOPWORDS = new Set([
+  'pekerjaan', 'pasang', 'pemasangan', 'merk', 'ukuran', 'warna',
+  'dan', 'atau', 'dengan', 'untuk', 'unit', 'buah', 'set', 'type'
+]);
+
+const tokenizeJobName = (value?: string | null) =>
+  normalizeJobName(value)
+    .split(' ')
+    .filter((token) => token.length > 1 && !JOB_MATCH_STOPWORDS.has(token));
+
+const levenshteinDistance = (left: string, right: string) => {
+  if (left === right) return 0;
+  if (!left) return right.length;
+  if (!right) return left.length;
+
+  const previous = Array.from({ length: right.length + 1 }, (_, index) => index);
+  const current = Array(right.length + 1).fill(0);
+
+  for (let i = 1; i <= left.length; i += 1) {
+    current[0] = i;
+    for (let j = 1; j <= right.length; j += 1) {
+      const substitutionCost = left[i - 1] === right[j - 1] ? 0 : 1;
+      current[j] = Math.min(
+        current[j - 1] + 1,
+        previous[j] + 1,
+        previous[j - 1] + substitutionCost
+      );
+    }
+    for (let j = 0; j <= right.length; j += 1) previous[j] = current[j];
+  }
+
+  return previous[right.length];
+};
+
+const stringSimilarity = (left: string, right: string) => {
+  const a = normalizeJobName(left);
+  const b = normalizeJobName(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+
+  const maxLength = Math.max(a.length, b.length);
+  return maxLength === 0 ? 0 : 1 - (levenshteinDistance(a, b) / maxLength);
+};
+
+const tokenSimilarity = (left: string, right: string) => {
+  const leftTokens = new Set(tokenizeJobName(left));
+  const rightTokens = new Set(tokenizeJobName(right));
+  if (leftTokens.size === 0 || rightTokens.size === 0) return 0;
+
+  let overlap = 0;
+  leftTokens.forEach((token) => {
+    if (rightTokens.has(token)) overlap += 1;
+  });
+
+  return (2 * overlap) / (leftTokens.size + rightTokens.size);
+};
+
+const fuzzyJobScore = (left?: string | null, right?: string | null) => {
+  const a = normalizeJobName(left);
+  const b = normalizeJobName(right);
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+
+  const stringScore = stringSimilarity(a, b);
+  const tokenScore = tokenSimilarity(a, b);
+  const containsBonus = a.includes(b) || b.includes(a) ? 0.08 : 0;
+  return Math.min(1, Math.max(stringScore, (tokenScore * 0.78) + (stringScore * 0.22) + containsBonus));
+};
+
+const normalizePriceCategoryName = (value?: string | null) =>
+  String(value ?? '').toLowerCase().replace(/\s+/g, ' ').replace(/[^\p{L}\p{N}\s&/]/gu, '').trim();
+
+type PriceMasterItem = {
+  "Jenis Pekerjaan"?: string;
+  "Satuan"?: string;
+  "Harga Material"?: number | string;
+  "Harga Upah"?: number | string;
+  "Input Material Manual"?: boolean | string | number;
+  "Input Upah Manual"?: boolean | string | number;
+};
+
+type PriceMaster = Record<string, PriceMasterItem[]>;
+
+const getPriceItemsForCategory = (priceData: PriceMaster, category: string): PriceMasterItem[] => {
+  if (Array.isArray(priceData?.[category])) return priceData[category];
+
+  const targetKey = normalizePriceCategoryName(category);
+  const matchedEntry = Object.entries(priceData || {}).find(([key]) => normalizePriceCategoryName(key) === targetKey);
+  return matchedEntry?.[1] || [];
+};
+
+const findBestMasterPriceMatch = (
+  masterPrices: PriceMaster,
+  category: string,
+  jenisPekerjaan: string
+): { category: string; item: PriceMasterItem } | null => {
+  const normalizedJob = normalizeJobName(jenisPekerjaan);
+  if (!normalizedJob) return null;
+
+  const categoryItems = getPriceItemsForCategory(masterPrices, category);
+  const exactCategoryMatch = categoryItems.find((item) => normalizeJobName(item["Jenis Pekerjaan"]) === normalizedJob);
+  if (exactCategoryMatch) return { category, item: exactCategoryMatch };
+
+  const allCandidates = Object.entries(masterPrices || {})
+    .flatMap(([candidateCategory, items]) => items.map((item) => ({ category: candidateCategory, item })));
+  const exactAnyCategoryMatch = allCandidates.find(({ item }) => normalizeJobName(item["Jenis Pekerjaan"]) === normalizedJob);
+  if (exactAnyCategoryMatch) return exactAnyCategoryMatch;
+
+  const normalizedCategory = normalizePriceCategoryName(category);
+  const ranked = allCandidates
+    .map((candidate) => {
+      const sameCategory = normalizePriceCategoryName(candidate.category) === normalizedCategory;
+      const score = fuzzyJobScore(jenisPekerjaan, candidate.item["Jenis Pekerjaan"]) + (sameCategory ? 0.04 : 0);
+      return { ...candidate, score };
+    })
+    .filter((candidate) => candidate.score >= FUZZY_JOB_MATCH_THRESHOLD)
+    .sort((a, b) => b.score - a.score);
+
+  if (ranked.length === 0) return null;
+  const [best, second] = ranked;
+  if (second && best.score - second.score < FUZZY_JOB_MATCH_MARGIN) return null;
+
+  return { category: best.category, item: best.item };
+};
+
+type RabTableRow = {
+  category: string;
+  jenisPekerjaan: string;
+  satuan: string;
+  volume: number | string;
+  hargaMaterial: number;
+  hargaUpah: number;
+  isKondisional: boolean;
+  isMaterialKondisional?: boolean;
+  isUpahKondisional?: boolean;
+  [key: string]: unknown;
+};
+
+type RevisionComparableRow = {
+  category: string;
+  jenisPekerjaan: string;
+  satuan: string;
+  volume: number;
+  hargaMaterial: number;
+  hargaUpah: number;
+  catatan: string;
+};
+
+type TokoDetailPartial = {
+  alamat?: string | null;
+  cabang?: string | null;
+};
+
+const DEFAULT_REVISION_ITEM_NOTE = "Item ini diminta untuk direvisi. Silakan lakukan minimal 1 perubahan pada item ini.";
+
+const toComparableRevisionRow = (row: Partial<RabTableRow>): RevisionComparableRow => ({
+  category: String(row?.category ?? '').trim(),
+  jenisPekerjaan: String(row?.jenisPekerjaan ?? '').trim(),
+  satuan: String(row?.satuan ?? '').trim(),
+  volume: volumeToNumber(row?.volume),
+  hargaMaterial: Number(row?.hargaMaterial) || 0,
+  hargaUpah: Number(row?.hargaUpah) || 0,
+  catatan: String(row?.catatan ?? '').trim(),
+});
+
+const isRevisionRowChanged = (current: Partial<RabTableRow>, initial?: RevisionComparableRow) => {
+  if (!initial) return false;
+  return JSON.stringify(toComparableRevisionRow(current)) !== JSON.stringify(initial);
+};
+
+const normalizeRabScope = (value?: string | null) => {
+  const upper = String(value ?? '').trim().toUpperCase();
+  if (upper === 'SIPIL') return 'Sipil';
+  if (upper === 'ME') return 'ME';
+  return upper;
+};
+
+const extractRabListUlok = (rab: any) =>
+  String(rab?.nomor_ulok || rab?.toko?.nomor_ulok || rab?.['Nomor Ulok'] || rab?.['Nomor_Ulok'] || '').trim().toUpperCase();
+
+const extractRabListScope = (rab: any) =>
+  normalizeRabScope(rab?.lingkup_pekerjaan || rab?.toko?.lingkup_pekerjaan || rab?.['Lingkup Pekerjaan'] || rab?.['Lingkup_Pekerjaan']);
+
+const getOppositeRabScope = (scope: string) => scope === 'Sipil' ? 'ME' : scope === 'ME' ? 'Sipil' : '';
+
+const resolveProjectFromSource = (project?: string | null, nomorUlok?: string | null) => {
+  const rawProject = String(project || '').trim();
+  const upperProject = rawProject.toUpperCase();
+  const isRenovasiUlok = String(nomorUlok || '').trim().toUpperCase().endsWith('-R');
+  let isRenovasi = isRenovasiUlok;
+  let proyek = rawProject;
+
+  if (upperProject.includes('PERLUASAN')) { proyek = 'Renovasi Perluasan'; isRenovasi = true; }
+  else if (upperProject.includes('PERPANJANGAN')) { proyek = 'Renovasi Perpanjangan'; isRenovasi = true; }
+  else if (upperProject.includes('TUTUP')) { proyek = 'Renovasi Toko Tutup'; isRenovasi = true; }
+  else if (upperProject.includes('PEREMAJAAN') || upperProject.includes('PERBAIKAN')) { proyek = 'Renovasi Peremajaan'; isRenovasi = true; }
+  else if (upperProject === 'RENOVASI') { proyek = ''; isRenovasi = true; }
+  else if (upperProject === 'REGULER') { proyek = 'Reguler'; isRenovasi = false; }
+  else if (isRenovasi && (!proyek || !proyek.toLowerCase().startsWith('renovasi'))) { proyek = ''; }
+
+  let finalProyek = proyek || (isRenovasi ? '' : 'Reguler');
+  if (finalProyek === 'Renovasi') finalProyek = '';
+
+  return { proyek: finalProyek, isRenovasi };
+};
+
+const normalizeKategoriLokasi = (value?: string | null) => {
+  const upper = String(value ?? '').trim().toUpperCase();
+  if (upper === 'RUKO') return 'Ruko';
+  if (upper === 'NON RUKO' || upper === 'NON_RUKO') return 'Non Ruko';
+  return String(value ?? '').trim();
+};
+
+const priceValueToNumber = (value: unknown, fallback: number) => {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (!trimmed || /^(kondisional|sbo)$/i.test(trimmed)) return fallback;
+    if (trimmed.toLowerCase().includes('kontraktor')) return 0;
+    const parsed = Number(trimmed.replace(/[.,](?=\d{3}(\D|$))/g, '').replace(',', '.'));
+    return Number.isFinite(parsed) ? parsed : fallback;
+  }
+  return fallback;
+};
+
+const isConditionalPriceValue = (value: unknown) =>
+  String(value ?? '').trim().toLowerCase() === 'kondisional';
+
+const isNumericPriceValue = (value: unknown) => {
+  if (typeof value === 'number') return Number.isFinite(value);
+  if (typeof value !== 'string') return false;
+
+  const trimmed = value.trim();
+  if (!trimmed || trimmed === '-') return false;
+
+  const parsed = Number(trimmed.replace(/[.,](?=\d{3}(\D|$))/g, '').replace(',', '.'));
+  return Number.isFinite(parsed);
+};
+
+const isBebanKontraktor = (value: unknown) => 
+  typeof value === 'string' && String(value).trim().toLowerCase().includes('kontraktor');
+
+const isTextPriceDirective = (value: unknown) =>
+  typeof value === 'string' && value.trim() !== '' && value.trim() !== '-' && !isNumericPriceValue(value) && !isBebanKontraktor(value);
+
+const isManualInputFlag = (value: unknown) =>
+  value === true || value === 1 || String(value ?? '').trim().toLowerCase() === 'true';
+
+const getManualPriceFlags = (itemData?: PriceMasterItem) => {
+  const materialDirectiveToUpah = isTextPriceDirective(itemData?.["Harga Material"]);
+  const isMatCond = !materialDirectiveToUpah && (
+    isManualInputFlag(itemData?.["Input Material Manual"]) ||
+    isConditionalPriceValue(itemData?.["Harga Material"])
+  );
+  const isUpahCond =
+    materialDirectiveToUpah ||
+    isManualInputFlag(itemData?.["Input Upah Manual"]) ||
+    isConditionalPriceValue(itemData?.["Harga Upah"]);
+
+  return { materialDirectiveToUpah, isMatCond, isUpahCond };
+};
+
+const repriceRowsWithMaster = <T extends RabTableRow>(rows: T[], masterPrices: PriceMaster): T[] => {
+  const lookup = new Map<string, PriceMasterItem & { category: string }>();
+  Object.entries(masterPrices || {}).forEach(([category, items]) => {
+    items.forEach((item) => {
+      const key = normalizeJobName(item?.["Jenis Pekerjaan"]);
+      if (key && !lookup.has(key)) lookup.set(key, { ...item, category });
+    });
+  });
+
+  return rows.map((row) => {
+    if (!row.jenisPekerjaan) return row;
+    const itemData = lookup.get(normalizeJobName(row.jenisPekerjaan));
+    if (!itemData) return row;
+
+    const { materialDirectiveToUpah, isMatCond, isUpahCond } = getManualPriceFlags(itemData);
+    return {
+      ...row,
+      category: itemData.category || row.category,
+      satuan: itemData["Satuan"] || row.satuan,
+      hargaMaterial: materialDirectiveToUpah ? 0 : isMatCond ? row.hargaMaterial : priceValueToNumber(itemData["Harga Material"], row.hargaMaterial),
+      hargaUpah: isUpahCond ? row.hargaUpah : priceValueToNumber(itemData["Harga Upah"], row.hargaUpah),
+      isKondisional: isMatCond || isUpahCond,
+      isMaterialKondisional: isMatCond,
+      isUpahKondisional: isUpahCond,
+      volume: itemData["Satuan"] === 'Ls' ? 1 : row.volume,
+    };
+  });
+};
+
+const refreshRevisionRowsWithMasterPrices = <T extends RabTableRow>(rows: T[], masterPrices: PriceMaster): T[] => {
+  return rows.map((row) => {
+    if (!row.category || !row.jenisPekerjaan) return row;
+
+    const match = findBestMasterPriceMatch(masterPrices, row.category, row.jenisPekerjaan);
+    if (!match) return row;
+
+    const itemData = match.item;
+    const { materialDirectiveToUpah, isMatCond, isUpahCond } = getManualPriceFlags(itemData);
+    return {
+      ...row,
+      category: match.category || row.category,
+      jenisPekerjaan: itemData["Jenis Pekerjaan"] || row.jenisPekerjaan,
+      satuan: itemData["Satuan"] || row.satuan,
+      hargaMaterial: materialDirectiveToUpah ? 0 : isMatCond ? row.hargaMaterial : priceValueToNumber(itemData["Harga Material"], row.hargaMaterial),
+      hargaUpah: isUpahCond ? row.hargaUpah : priceValueToNumber(itemData["Harga Upah"], row.hargaUpah),
+      isKondisional: isMatCond || isUpahCond,
+      isMaterialKondisional: isMatCond,
+      isUpahKondisional: isUpahCond,
+    };
+  });
+};
+
+const getPriceDirectiveForRow = (priceData: PriceMaster, row: Partial<RabTableRow>) => {
+  if (!row.category || !row.jenisPekerjaan) {
+    return {
+      materialDirectiveToUpah: false,
+      isMaterialEditable: Boolean(row.isMaterialKondisional),
+      isUpahEditable: Boolean(row.isUpahKondisional),
+    };
+  }
+
+  const itemData = getPriceItemsForCategory(priceData, String(row.category))
+    .find((item) => item["Jenis Pekerjaan"] === row.jenisPekerjaan);
+
+  const { materialDirectiveToUpah, isMatCond, isUpahCond } = getManualPriceFlags(itemData);
+  return {
+    materialDirectiveToUpah,
+    isMaterialEditable: !materialDirectiveToUpah && (Boolean(row.isMaterialKondisional) || isMatCond),
+    isUpahEditable: Boolean(row.isUpahKondisional) || isUpahCond,
+  };
+};
+
+function RABPageContent() {
+  const router = useRouter();
+  const searchParams = useSearchParams();
+  const requestedPlanningId = Number(searchParams.get('projek_planning_id') || 0);
+  const requestedScope = searchParams.get('lingkup')?.toUpperCase();
+  const requestedRevisionId = Number(searchParams.get('revision_id') || 0);
+  const [planningRequestOverridden, setPlanningRequestOverridden] = useState(false);
+  const hasProjectPlanningRequest = !planningRequestOverridden
+    && Number.isInteger(requestedPlanningId)
+    && requestedPlanningId > 0
+    && (requestedScope === 'SIPIL' || requestedScope === 'ME');  
+  
+  const [activeWarnings, setActiveWarnings] = useState<DendaAction[]>([]);
+
+  // Pembersih Sisa Radix UI Lock Global (Universal Anti-Freeze)
+  useEffect(() => {
+    const nukeScrollLocks = () => {
+      document.documentElement.style.pointerEvents = '';
+      document.documentElement.style.overflow = '';
+      document.documentElement.removeAttribute('data-scroll-locked');
+      
+      document.body.style.pointerEvents = '';
+      document.body.style.overflow = '';
+      document.body.removeAttribute('data-scroll-locked');
+      
+      document.querySelectorAll('[data-radix-scroll-lock-style]').forEach(el => el.remove());
+    };
+
+    // Jalankan sekali saat mount
+    nukeScrollLocks();
+    
+    // Interval permanen: jika Radix gagal cleanup (misal setelah Alert ditutup), paksa bersihkan!
+    const interval = setInterval(() => {
+      // Cek apakah memang ada Modal/Dialog yang sedang terbuka
+      const isModalOpen = document.querySelector('[role="dialog"][data-state="open"], [role="alertdialog"][data-state="open"]');
+      if (!isModalOpen) {
+        nukeScrollLocks();
+      }
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, []);
+  // --- STATE FORM DASAR ---
+  const [formData, setFormData] = useState({
+    namaToko: '', lokasiCabang: '', lokasiTanggal: '', lokasiManual: '', isRenovasi: true, isTakeover: false,
+    proyek: '', alamat: '', cabang: '', lingkupPekerjaan: '', kategoriLokasi: '', durasiPekerjaan: '',
+    luasAreaParkir: '', luasAreaSales: '', luasGudang: '', luasBangunan: '', luasAreaTerbuka: '',
+    logo: '', // Base64 logo string
+    noPolis: '', berlakuPolis: '', fileAsuransi: '', // URL link file asuransi (jika sudah ada dari revisi)
+    alamatCabang: ''
+  });
+
+  const [logoPreview, setLogoPreview] = useState<string | null>(null);
+  const [currentRabId, setCurrentRabId] = useState<number | null>(null);
+  const [asuransiFileName, setAsuransiFileName] = useState<string | null>(null);
+  const [asuransiFile, setAsuransiFile] = useState<File | null>(null); // Raw file object untuk multipart upload
+  const asuransiFileRef = useRef<HTMLInputElement>(null);
+
+  const [availableCabang, setAvailableCabang] = useState<string[]>([]);
+  const [prices, setPrices] = useState<any>({});
+  const [tableRows, setTableRows] = useState<any[]>([]);
+
+  const [tokoListOptions, setTokoListOptions] = useState<any[]>([]);
+  const [isLoadingToko, setIsLoadingToko] = useState(false);
+  
+  const [maintenanceStores, setMaintenanceStores] = useState<MaintenanceStore[]>([]);
+  const [tokoSearchQuery, setTokoSearchQuery] = useState("");
+  
+  useEffect(() => {
+    if (formData.namaToko && !tokoSearchQuery) {
+      setTokoSearchQuery(formData.namaToko);
+    }
+  }, [formData.namaToko]);
+  
+  const [isLoadingMaintenanceStores, setIsLoadingMaintenanceStores] = useState(false);
+  
+  const [rejectedList, setRejectedList] = useState<any[]>([]);
+  const [planningRequests, setPlanningRequests] = useState<RabProjectPlanningRequest[]>([]);
+  const [planningRequestsLoading, setPlanningRequestsLoading] = useState(false);
+  const [planningRequestDialogOpen, setPlanningRequestDialogOpen] = useState(false);
+  const [planningPrefillLoading, setPlanningPrefillLoading] = useState(false);
+  const [autoLoadedRevisionId, setAutoLoadedRevisionId] = useState<number | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isRevisionLoading, setIsRevisionLoading] = useState(false);
+  const [alertOpen, setAlertOpen] = useState(false);
+  const [alertMessage, setAlertMessage] = useState<{title: string, desc: string, type: 'info' | 'error' | 'success' | 'warning'}>({ title: "", desc: "", type: "info" });
+  
+  const [resetDialogOpen, setResetDialogOpen] = useState(false);
+  const [revisionListDialogOpen, setRevisionListDialogOpen] = useState(false);
+  const [revisionCheckDone, setRevisionCheckDone] = useState(false);
+  const revisionHadItemsRef = useRef(false);
+  const planningAutoOpenDoneRef = useRef(false);
+  const [revisionRejectReason, setRevisionRejectReason] = useState('');
+  const [revisionItemNotes, setRevisionItemNotes] = useState<Record<number, string>>({});
+  const [revisionItemOriginals, setRevisionItemOriginals] = useState<Record<number, RevisionComparableRow>>({});
+  
+  // State untuk melacak perubahan pada form revisi
+  const [initialFormState, setInitialFormState] = useState<string | null>(null);
+  const crossScopePrefillKeyRef = useRef<string | null>(null);
+  const [crossScopeProjectLocked, setCrossScopeProjectLocked] = useState(false);
+
+  // --- 1a. DRAFT (AUTO-SAVE) ---
+  const [draftDialogOpen, setDraftDialogOpen] = useState(false);
+  const [draftData, setDraftData] = useState<any>(null);
+  const draftAutosaveDisabledRef = useRef(false);
+  const userInitializedRef = useRef(false);
+
+  // Reset state revisi saat component mount (setiap navigasi ke halaman ini)
+  // Mencegah state revisi lama terbawa saat user kembali via browser back button
+  useEffect(() => {
+    setCurrentRabId(null);
+    setRevisionItemNotes({});
+    setRevisionItemOriginals({});
+    setRevisionRejectReason('');
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+     if (initialFormState === "TRACKING_PENDING" && !isLoading) {
+         setInitialFormState(JSON.stringify({ formData, tableRows }));
+     }
+  }, [isLoading, formData, tableRows, initialFormState]);
+
+  const isFormModified = initialFormState && initialFormState !== "TRACKING_PENDING" 
+      ? JSON.stringify({ formData, tableRows }) !== initialFormState 
+      : true;
+
+  const hasUnchangedRevisionItems = useMemo(() => {
+    if (!currentRabId) return false;
+    const revisionItemIds = Object.keys(revisionItemNotes)
+      .map(Number)
+      .filter(itemId => Number.isFinite(itemId) && itemId > 0);
+
+    if (revisionItemIds.length === 0) return false;
+
+    return revisionItemIds.some(itemId => {
+      const currentRow = tableRows.find(row => Number(row.sourceItemId) === itemId);
+      return !currentRow || !isRevisionRowChanged(currentRow, revisionItemOriginals[itemId]);
+    });
+  }, [currentRabId, revisionItemNotes, revisionItemOriginals, tableRows]);
+
+  // --- 1. INISIALISASI SESI & CEK STATUS REVISI ---
+  const { user } = useSession();
+  const isSuperHuman = user?.isSuperHuman ?? false;
+  const isContractor = user?.roles?.some(role => role.includes('KONTRAKTOR')) ?? false;
+  const isReadOnly = isViewOnlyUser(user?.roles, isSuperHuman) && !isContractor;
+
+  useEffect(() => {
+    if (isContractor) {
+      fetchDendaActions({ action_type: 'SP' })
+        .then(res => {
+          if (res.data) {
+            const active = res.data.filter(sp => 
+              sp.is_active && 
+              ['APPROVED', 'SENT_TO_CONTRACTOR', 'VIEWED_BY_CONTRACTOR', 'ACKNOWLEDGED_BY_CONTRACTOR'].includes(sp.status)
+            );
+            setActiveWarnings(active);
+          }
+        })
+        .catch(console.error);
+    }
+  }, [isContractor]);
+
+  useEffect(() => {
+    // Simpan otomatis jika tidak dalam mode loading, bukan readonly, tidak sedang edit revisi (currentRabId == null),
+    // dan jika form atau tabel sudah terisi sebagian
+    if (!draftAutosaveDisabledRef.current && !isLoading && !isReadOnly && user?.email && !currentRabId && !hasProjectPlanningRequest) {
+      const draftKey = `rab_draft_${user.email}_${user.role}_${user.cabang}`;
+      const hasData = tableRows.length > 0 || formData.namaToko.trim() !== '' || formData.lokasiTanggal.trim() !== '';
+      if (hasData) {
+         localStorage.setItem(draftKey, JSON.stringify({ formData, tableRows }));
+      }
+    }
+  }, [formData, tableRows, isLoading, isReadOnly, user, currentRabId, hasProjectPlanningRequest]);
+
+  useEffect(() => {
+    if (!user?.cabang) return;
+    const loadMaintenanceStores = async () => {
+      setIsLoadingMaintenanceStores(true);
+      try {
+        const parentBranch = getParentBranch(user.cabang || '');
+        const data = await fetchMaintenanceStores(parentBranch);
+        setMaintenanceStores(data);
+      } catch (err) {
+        console.error("Gagal load maintenance stores:", err);
+      } finally {
+        setIsLoadingMaintenanceStores(false);
+      }
+    };
+    loadMaintenanceStores();
+  }, [user?.cabang]);
+
+  useEffect(() => {
+    if (user?.email && !currentRabId && !hasProjectPlanningRequest) {
+      const draftKey = `rab_draft_${user.email}_${user.role}_${user.cabang}`;
+      const savedDraft = localStorage.getItem(draftKey);
+      if (savedDraft) {
+        try {
+          const parsed = JSON.parse(savedDraft);
+          if (parsed && parsed.formData && (parsed.tableRows?.length > 0 || parsed.formData.namaToko !== '')) {
+            
+            // --- LOGIKA BARU: BLOKIR DRAFT REGULER ---
+            if (parsed.formData.isRenovasi === false || parsed.formData.proyek === 'Reguler') {
+              // 1. Hapus draft dari storage
+              localStorage.removeItem(draftKey);
+              // 2. Munculkan error / warning kepada pengguna
+              showAlert(
+                "Draft Tidak Didukung", 
+                "Draft yang tersimpan sebelumnya adalah draft Reguler. Saat ini sistem hanya mendukung pengajuan Renovasi. Draft lama Anda telah dihapus otomatis, silakan buat pengajuan dari awal.", 
+                "warning"
+              );
+              // 3. Hentikan eksekusi, biarkan form tetap default (Renovasi)
+              return;
+            }
+            // ----------------------------------------
+
+            setDraftData(parsed);
+            setDraftDialogOpen(true);
+          }
+        } catch (e) {
+          console.error("Gagal load draft RAB", e);
+        }
+      }
+    }
+  }, [user, currentRabId, hasProjectPlanningRequest]);
+
+  const loadDraft = () => {
+    if (draftData) {
+      setFormData(draftData.formData);
+      setTableRows(draftData.tableRows || []);
+      setCrossScopeProjectLocked(false);
+    }
+    setDraftDialogOpen(false);
+  };
+
+  const deleteDraft = () => {
+    if (user?.email && user?.role && user?.cabang) {
+      localStorage.removeItem(`rab_draft_${user.email}_${user.role}_${user.cabang}`);
+    }
+    setCrossScopeProjectLocked(false);
+    setDraftData(null);
+    setDraftDialogOpen(false);
+  };
+
+  useEffect(() => {
+    if (!user) return;
+    if (userInitializedRef.current) return;
+    userInitializedRef.current = true;
+
+    // Reset semua state revisi saat user/session berubah
+    // Mencegah state lama terbawa saat user kembali ke halaman ini via browser back
+    setCurrentRabId(null);
+    setRevisionItemNotes({});
+    setRevisionItemOriginals({});
+    setRevisionRejectReason('');
+    setRevisionCheckDone(false);
+    revisionHadItemsRef.current = false;
+    planningAutoOpenDoneRef.current = false;
+
+    const userCabang = user.cabang.toUpperCase();
+    const userEmail = user.email;
+    const userAlamatCabang = user.alamatCabang || '';
+    const isSuperHuman = user?.isSuperHuman ?? false;
+    
+    if (canViewAllBranches(user.roles, isSuperHuman)) {
+      setAvailableCabang(Object.keys(BRANCH_TO_ULOK).sort());
+    } else {
+      setAvailableCabang(BRANCH_GROUPS[userCabang] || [userCabang]);
+    }
+    
+    const defaultLokasiCabang = BRANCH_TO_ULOK[getParentBranch(userCabang)] || "KODE";
+
+    setFormData(prev => ({ ...prev, cabang: userCabang, lokasiCabang: defaultLokasiCabang, alamatCabang: userAlamatCabang }));
+
+        if (userEmail && userCabang) {
+            // Fetch Toko List for Takeover
+            const loadToko = async () => {
+                setIsLoadingToko(true);
+                try {
+                    const { fetchTokoList } = await import('@/lib/api');
+                    const isHO = canViewAllBranches(user.roles, isSuperHuman);
+                    const params = isHO ? undefined : { cabang: userCabang };
+                    const res = await fetchTokoList(params);
+                    if (res?.data) {
+                        // Hilangkan duplikat nomor_ulok
+                        const uniqueToko = Array.from(new Map(res.data.map((item: any) => [item.nomor_ulok, item])).values());
+                        setTokoListOptions(uniqueToko);
+                    }
+                } catch (e) {
+                    console.error("Failed to load toko list", e);
+                } finally {
+                    setIsLoadingToko(false);
+                }
+            };
+            loadToko();
+
+            checkRevisionStatus(userEmail, userCabang).then(result => {
+                const revisions = result.rejected_submissions || [];
+                setRejectedList(revisions);
+                revisionHadItemsRef.current = revisions.length > 0;
+                // FIX #2: Only auto-open modal if user NOT coming from direct revision link
+                if (revisions.length > 0 && !requestedRevisionId) {
+                    setRevisionListDialogOpen(true); // Membuka modal notification lonceng secara otomatis ketika data ditolak terdeteksi
+                }
+            }).catch(err => {
+          revisionHadItemsRef.current = false;
+          console.log("Gagal periksa revisi", err);
+        }).finally(() => setRevisionCheckDone(true));
+    } else {
+      setRevisionCheckDone(true);
+    }
+  }, [user]);
+
+  useEffect(() => {
+    if (!user?.email || !isContractor) {
+      setPlanningRequests([]);
+      return;
+    }
+
+    let cancelled = false;
+    setPlanningRequestsLoading(true);
+    fetchRabProjectPlanningRequests(user.email, { suppressGlobalError: true })
+      .then((result) => {
+        if (!cancelled) setPlanningRequests(result.data || []);
+      })
+      .catch(() => {
+        if (!cancelled) setPlanningRequests([]);
+      })
+      .finally(() => {
+        if (!cancelled) setPlanningRequestsLoading(false);
+      });
+
+    return () => { cancelled = true; };
+  }, [user?.email, isContractor]);
+
+  useEffect(() => {
+    if (
+      hasProjectPlanningRequest ||
+      !isContractor ||
+      planningAutoOpenDoneRef.current ||
+      !revisionCheckDone ||
+      planningRequestsLoading ||
+      planningRequests.length === 0
+    ) {
+      return;
+    }
+
+    if (revisionHadItemsRef.current && revisionListDialogOpen) return;
+
+    planningAutoOpenDoneRef.current = true;
+    setPlanningRequestDialogOpen(true);
+  }, [
+    hasProjectPlanningRequest,
+    isContractor,
+    planningRequests.length,
+    planningRequestsLoading,
+    revisionCheckDone,
+    revisionListDialogOpen,
+  ]);
+
+  useEffect(() => {
+    if (!user?.email || !hasProjectPlanningRequest) return;
+
+    let cancelled = false;
+    setPlanningPrefillLoading(true);
+    fetchRabProjectPlanningPrefill(
+      requestedPlanningId,
+      requestedScope as "SIPIL" | "ME",
+      user.email
+    )
+      .then((result) => {
+        if (cancelled) return;
+        const prefill = result.data;
+        const parts = prefill.nomor_ulok.split('-');
+        const isRenovasi = parts.at(-1)?.toUpperCase() === 'R';
+        const rawProject = String(prefill.proyek || '').trim();
+        const normalizedProject = rawProject.toUpperCase();
+        const projectValue = isRenovasi
+          ? (normalizedProject.includes('PERLUASAN') ? 'Renovasi Perluasan'
+            : normalizedProject.includes('PERPANJANGAN') ? 'Renovasi Perpanjangan'
+            : normalizedProject.includes('TUTUP') ? 'Renovasi Toko Tutup'
+            : normalizedProject.includes('PEREMAJAAN') || normalizedProject.includes('PERBAIKAN') ? 'Renovasi Peremajaan'
+            : '')
+          : normalizedProject === 'REGULER'
+          ? 'Reguler'
+          : rawProject;
+        const nextForm = {
+          ...formData,
+          namaToko: prefill.nama_toko || '',
+          lokasiCabang: parts[0] || '',
+          lokasiTanggal: parts[1] || '',
+          lokasiManual: parts[2] || '',
+          isRenovasi,
+          proyek: projectValue || (isRenovasi ? '' : 'Reguler'),
+          alamat: prefill.alamat || '',
+          cabang: normalizeBranchName(prefill.cabang),
+          lingkupPekerjaan: prefill.lingkup_pekerjaan === 'SIPIL' ? 'Sipil' : 'ME',
+          luasAreaParkir: prefill.luas_area_parkir || '',
+          luasAreaSales: prefill.luas_area_sales || '',
+          luasGudang: prefill.luas_gudang || '',
+          luasBangunan: prefill.luas_bangunan || '',
+          luasAreaTerbuka: prefill.luas_area_terbuka || '',
+        };
+        setFormData(nextForm);
+        setTableRows([]);
+        setInitialFormState(JSON.stringify({ formData: nextForm, tableRows: [] }));
+      })
+      .catch((error: Error) => {
+        showAlert("Permintaan Tidak Tersedia", error.message, "warning");
+        router.replace('/rab');
+      })
+      .finally(() => {
+        if (!cancelled) setPlanningPrefillLoading(false);
+      });
+
+    return () => { cancelled = true; };
+    // Prefill hanya dijalankan ketika identitas request pada URL berubah.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.email, hasProjectPlanningRequest, requestedPlanningId, requestedScope, router]);
+
+  // --- 2. FETCH HARGA OTOMATIS ---
+  useEffect(() => {
+    if (formData.cabang && formData.lingkupPekerjaan) {
+        const activeCabang = getRabPriceBranch(formData.cabang);
+        fetchPricesData(activeCabang, formData.lingkupPekerjaan)
+            .then(data => {
+                setPrices(data);
+                // Harga master hanya dipakai untuk pilihan item baru.
+                // Jangan otomatis reprice rows revisi karena bisa memindahkan kategori dan menimpa harga input user.
+            })
+            .catch(err => showAlert("Error", err.message, "error"));
+    }
+  }, [formData.cabang, formData.lingkupPekerjaan]);
+
+  // --- 3. DETEKSI OTOMATIS DATA REVISI ---
+  const getUlokString = () => `${formData.lokasiCabang.toUpperCase()}-${formData.lokasiTanggal.toUpperCase()}-${formData.lokasiManual.toUpperCase()}${formData.isRenovasi ? '-R' : ''}`;
+
+  useEffect(() => {
+    if (
+      isReadOnly ||
+      !isContractor ||
+      hasProjectPlanningRequest ||
+      currentRabId ||
+      formData.lokasiCabang.length < 4 ||
+      formData.lokasiTanggal.length !== 4 ||
+      formData.lokasiManual.length !== 4
+    ) {
+      return;
+    }
+
+    const currentScope = normalizeRabScope(formData.lingkupPekerjaan);
+    const baseUlok = `${formData.lokasiCabang.toUpperCase()}-${formData.lokasiTanggal.toUpperCase()}-${formData.lokasiManual.toUpperCase()}`;
+    const candidateUloks = Array.from(new Set(formData.isRenovasi ? [getUlokString(), baseUlok] : [baseUlok, `${baseUlok}-R`]));
+    const candidateUlokSet = new Set(candidateUloks.map((ulok) => ulok.toUpperCase()));
+    const lookupKey = `${[...candidateUloks].sort().join('|')}::${currentScope || 'AUTO'}`;
+    if (crossScopePrefillKeyRef.current === lookupKey) return;
+
+    let cancelled = false;
+    crossScopePrefillKeyRef.current = lookupKey;
+
+    const loadCrossScopePrefill = async () => {
+      try {
+        const listResults = await Promise.all(
+          candidateUloks.map((nomor_ulok) =>
+            fetchRABList({ nomor_ulok }, { suppressGlobalError: true }).catch(() => ({ status: 'error', data: [] }))
+          )
+        );
+        if (cancelled) return;
+
+        const seenRabIds = new Set<number>();
+        const exactMatches = listResults
+          .flatMap((result) => result.data || [])
+          .filter((rab: any) => {
+            const rabId = Number(rab?.id);
+            if (!rabId || seenRabIds.has(rabId)) return false;
+            seenRabIds.add(rabId);
+            const rabUlok = extractRabListUlok(rab);
+            if (!candidateUlokSet.has(rabUlok)) return false;
+            return true;
+          })
+          .sort((a: any, b: any) => new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime());
+
+        if (!currentScope) {
+          const existingScopes = new Set(exactMatches.map(extractRabListScope).filter(Boolean));
+          const inferredScope = existingScopes.has('Sipil') && !existingScopes.has('ME')
+            ? 'ME'
+            : existingScopes.has('ME') && !existingScopes.has('Sipil')
+              ? 'Sipil'
+              : '';
+          if (inferredScope) {
+            setFormData(prev => ({ ...prev, lingkupPekerjaan: inferredScope }));
+            setTableRows([]);
+          }
+          return;
+        }
+
+        let sourceIdToUse: number | null = null;
+        let detailData: any = null;
+        let isTakeoverSecondScope = false;
+
+        if (formData.isTakeover) {
+          const oppositeRabs = exactMatches.filter((rab: any) => extractRabListScope(rab) === getOppositeRabScope(currentScope));
+          const sameRabs = exactMatches.filter((rab: any) => extractRabListScope(rab) === currentScope);
+
+          if (oppositeRabs.length > 0) {
+            const oppDetail = await fetchRABDetail(Number(oppositeRabs[0].id));
+            if ((oppDetail.data?.toko?.takeover_sequence || 0) > 0) {
+              // Teman lintas lingkup dari takeover yang sama sudah ada!
+              sourceIdToUse = Number(oppositeRabs[0].id);
+              detailData = oppDetail.data;
+              isTakeoverSecondScope = true;
+            }
+          }
+
+          if (!sourceIdToUse) {
+            // Jatuh kembali ke RAB lama (prioritaskan lingkup yang sama)
+            if (sameRabs.length > 0) {
+              sourceIdToUse = Number(sameRabs[0].id);
+            } else if (oppositeRabs.length > 0) {
+              sourceIdToUse = Number(oppositeRabs[0].id);
+            } else if (exactMatches.length > 0) {
+              sourceIdToUse = Number(exactMatches[0].id);
+            }
+          }
+        } else {
+          const oppositeRabs = exactMatches.filter((rab: any) => extractRabListScope(rab) === getOppositeRabScope(currentScope));
+          if (oppositeRabs.length > 0) sourceIdToUse = Number(oppositeRabs[0].id);
+        }
+
+        if (!sourceIdToUse) return;
+
+        if (!detailData) {
+          const detailResult = await fetchRABDetail(sourceIdToUse);
+          if (cancelled) return;
+          detailData = detailResult.data;
+        }
+
+        const tokoRef = detailData.toko || {};
+        const rabRef = detailData.rab || {};
+        const sourceUlok = tokoRef.nomor_ulok || candidateUloks[0];
+        const sourceParts = String(sourceUlok).split('-');
+        const sourceProject = resolveProjectFromSource(tokoRef.proyek, sourceUlok);
+        const sourceScope = normalizeRabScope(tokoRef.lingkup_pekerjaan);
+        const targetScope = (formData.isTakeover && !isTakeoverSecondScope) ? currentScope : (getOppositeRabScope(sourceScope) || currentScope);
+        const sourceCabang = normalizeBranchName(tokoRef.cabang || formData.cabang);
+        const sourceAsuransi = rabRef.file_asuransi || '';
+        const sourceLogo = rabRef.logo || '';
+
+        const shouldPrefillAll = !formData.isTakeover || isTakeoverSecondScope;
+
+        setFormData(prev => ({
+          ...prev,
+          lokasiCabang: sourceParts[0] || prev.lokasiCabang,
+          lokasiTanggal: sourceParts[1] || prev.lokasiTanggal,
+          lokasiManual: sourceParts[2] || prev.lokasiManual,
+          isRenovasi: sourceProject.isRenovasi,
+          proyek: sourceProject.proyek,
+          cabang: sourceCabang || prev.cabang,
+          lingkupPekerjaan: targetScope,
+          namaToko: tokoRef.nama_toko || prev.namaToko,
+          alamat: tokoRef.alamat || prev.alamat,
+          kategoriLokasi: normalizeKategoriLokasi(rabRef.kategori_lokasi) || prev.kategoriLokasi,
+          durasiPekerjaan: shouldPrefillAll ? (String(rabRef.durasi_pekerjaan || '').replace(/[^0-9]/g, '') || prev.durasiPekerjaan) : prev.durasiPekerjaan,
+          luasAreaParkir: shouldPrefillAll ? (String(rabRef.luas_area_parkir || '') || prev.luasAreaParkir) : prev.luasAreaParkir,
+          luasAreaSales: shouldPrefillAll ? (String(rabRef.luas_area_sales || '') || prev.luasAreaSales) : prev.luasAreaSales,
+          luasGudang: shouldPrefillAll ? (String(rabRef.luas_gudang || '') || prev.luasGudang) : prev.luasGudang,
+          luasBangunan: shouldPrefillAll ? (String(rabRef.luas_bangunan || '') || prev.luasBangunan) : prev.luasBangunan,
+          luasAreaTerbuka: shouldPrefillAll ? (String(rabRef.luas_area_terbuka || '') || prev.luasAreaTerbuka) : prev.luasAreaTerbuka,
+          noPolis: shouldPrefillAll ? (String(rabRef.no_polis || '') || prev.noPolis) : prev.noPolis,
+          berlakuPolis: shouldPrefillAll ? (String(rabRef.berlaku_polis || '') || prev.berlakuPolis) : prev.berlakuPolis,
+          fileAsuransi: shouldPrefillAll ? (sourceAsuransi || prev.fileAsuransi) : prev.fileAsuransi,
+          logo: shouldPrefillAll ? (sourceLogo || prev.logo) : prev.logo,
+        }));
+        
+        if (shouldPrefillAll) {
+          setCrossScopeProjectLocked(true);
+          if (sourceLogo && !logoPreview) setLogoPreview(sourceLogo);
+          if (sourceAsuransi && !asuransiFileName && !asuransiFile) setAsuransiFileName(`File Asuransi (prefill ${sourceScope})`);
+        }
+
+        if (shouldPrefillAll) {
+          showAlert(
+            "Data proyek otomatis terisi",
+            `Header proyek diambil dari RAB ${sourceScope} untuk ULOK ${sourceUlok}. Lingkup otomatis diset ke ${targetScope} dan data proyek dikunci.`,
+            "info"
+          );
+        } else {
+          showAlert(
+            "Data Takeover otomatis terisi",
+            `Header proyek diambil dari RAB Takeover (${sourceScope}) untuk ULOK ${sourceUlok} sebelumnya. Data RAB telah diisi otomatis.`,
+            "info"
+          );
+        }
+      } catch (err) {
+        console.log("Prefill RAB lintas lingkup dilewati:", err);
+      }
+    };
+
+    loadCrossScopePrefill();
+
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    isReadOnly,
+    isContractor,
+    hasProjectPlanningRequest,
+    currentRabId,
+    formData.lokasiCabang,
+    formData.lokasiTanggal,
+    formData.lokasiManual,
+    formData.isRenovasi,
+    formData.lingkupPekerjaan,
+  ]);
+
+  // --- 3. DETEKSI OTOMATIS DATA REVISI (DIHAPUS SESUAI PERMINTAAN) ---
+
+  // --- 4. EKSEKUSI AUTO-FILL DATA REVISI ---
+  const handleLoadRevision = async (directItem?: any) => {
+      const data = directItem;
+      if (!data) return;
+      
+      const scope = data.lingkup_pekerjaan || data['Lingkup_Pekerjaan'] || data['Lingkup Pekerjaan'] || formData.lingkupPekerjaan;
+      
+      setIsRevisionLoading(true);
+
+      // Ekstrak komponen ULOK jika di-load dari "Revisi Sekarang"
+      let ulokStr = data['Nomor Ulok'] || data.nomor_ulok || '';
+      let parts = ulokStr.split('-');
+      let lokasiCabang = parts[0] || formData.lokasiCabang;
+      let lokasiTanggal = parts[1] || formData.lokasiTanggal;
+      let lokasiManual = parts[2] || formData.lokasiManual;
+      let isRenovasi = parts.length > 3 && parts[3] === 'R';
+
+      try {
+          // 1. Fetch detail spesifik RAB revisi ini jika ada ID (Lazy Load dari klik lonceng)
+          let fetchedDetailData: any = {};
+          let itemsData = typeof data["Item_Details_JSON"] === 'string' ? JSON.parse(data["Item_Details_JSON"]) : (data["Item_Details_JSON"] || []);
+          
+          if (data.id && (!itemsData || itemsData.length === 0)) {
+              try {
+                  const detailRes = await fetchRABDetail(data.id);
+                  fetchedDetailData = detailRes.data;
+                  itemsData = fetchedDetailData.items || [];
+              } catch (err) {
+                  console.error("Gagal mengambil detail RAB:", err);
+              }
+          }
+
+          const tokoRef = fetchedDetailData?.toko || data;
+          const rabRef = fetchedDetailData?.rab || data;
+          ulokStr = tokoRef.nomor_ulok || rabRef.nomor_ulok || data['Nomor Ulok'] || data.nomor_ulok || ulokStr;
+          parts = ulokStr.split('-');
+          lokasiCabang = parts[0] || lokasiCabang;
+          lokasiTanggal = parts[1] || lokasiTanggal;
+          lokasiManual = parts[2] || lokasiManual;
+          isRenovasi = parts.at(-1)?.toUpperCase() === 'R' || isRenovasi;
+          const revisionNotes = Array.isArray(fetchedDetailData?.revisi_items)
+              ? fetchedDetailData.revisi_items.reduce((acc: Record<number, string>, item: any) => {
+                  const itemId = Number(item.id_rab_item);
+                  const note = String(item.catatan_item || '').trim();
+                  if (Number.isFinite(itemId) && itemId > 0) acc[itemId] = note || DEFAULT_REVISION_ITEM_NOTE;
+                  return acc;
+              }, {})
+              : {};
+          const alasan = String(rabRef.alasan_penolakan || data.alasan_penolakan || '').trim();
+          const catatan = String(rabRef.catatan_penolakan || data.catatan_penolakan || '').trim();
+          setRevisionRejectReason(catatan ? `${alasan}\n\nCatatan General: ${catatan}` : alasan);
+          setRevisionItemNotes(revisionNotes);
+          
+          let fetchedTokoDetail: TokoDetailPartial | null = null;
+          let fetchedTokoAlamat = "";
+          if (rabRef.id_toko || tokoRef.id) {
+              try {
+                  const idToFetch = rabRef.id_toko || tokoRef.id;
+                  const tokoRes = await fetchTokoDetail(idToFetch);
+                  fetchedTokoDetail = tokoRes.data || null;
+                  fetchedTokoAlamat = fetchedTokoDetail?.alamat || "";
+              } catch (e) {
+                  console.log("Bypass fetch toko detail error");
+              }
+          }
+
+          // Lingkup pekerjaan asli akan didapatkan dari detail toko
+          let resolvedScope = tokoRef.lingkup_pekerjaan || scope;
+          if (resolvedScope?.toUpperCase() === 'SIPIL') resolvedScope = 'Sipil';
+          else if (resolvedScope?.toUpperCase() === 'ME') resolvedScope = 'ME';
+
+          const resolvedCabang = normalizeBranchName(
+              fetchedTokoDetail?.cabang || tokoRef.cabang || data.cabang || data["Cabang"] || formData.cabang
+          );
+
+          // 2. Fetch harga master sesuai wilayah harga induk dan lingkup pekerjaan dokumen
+          const fetchedPrices = await fetchPricesData(getRabPriceBranch(resolvedCabang), resolvedScope);
+          setPrices(fetchedPrices);
+
+          // Normalisasi Dropdown
+          let finalProyek = tokoRef.proyek || data["Proyek"] || formData.proyek;
+          const upperProyek = finalProyek?.toUpperCase() || '';
+          
+          if (upperProyek.includes('PERLUASAN')) { finalProyek = 'Renovasi Perluasan'; isRenovasi = true; }
+          else if (upperProyek.includes('PERPANJANGAN')) { finalProyek = 'Renovasi Perpanjangan'; isRenovasi = true; }
+          else if (upperProyek.includes('TUTUP')) { finalProyek = 'Renovasi Toko Tutup'; isRenovasi = true; }
+          else if (upperProyek.includes('PEREMAJAAN') || upperProyek.includes('PERBAIKAN')) { finalProyek = 'Renovasi Peremajaan'; isRenovasi = true; }
+          else if (upperProyek === 'RENOVASI') { finalProyek = 'Renovasi'; isRenovasi = true; }
+          else if (upperProyek === 'REGULER') { finalProyek = 'Reguler'; isRenovasi = false; }
+          else if (isRenovasi) {
+              if (finalProyek !== 'Renovasi' && !finalProyek.toLowerCase().startsWith('renovasi')) {
+                  finalProyek = 'Renovasi'; 
+              }
+          }
+
+          let finalKategori = rabRef.kategori_lokasi || data["Kategori_Lokasi"] || formData.kategoriLokasi;
+          if (finalKategori?.toUpperCase() === 'RUKO') finalKategori = 'Ruko';
+          else if (finalKategori?.toUpperCase() === 'NON RUKO' || finalKategori?.toUpperCase() === 'NON_RUKO') finalKategori = 'Non Ruko';
+
+          let finalDurasi = rabRef.durasi_pekerjaan || data["Durasi_Pekerjaan"] || formData.durasiPekerjaan;
+          if (finalDurasi) finalDurasi = finalDurasi.toString().replace(/[^0-9]/g, ''); // Ambil digit saja ("30 Hari" -> "30")
+
+          setFormData(prev => ({
+              ...prev,
+              lokasiCabang: lokasiCabang || BRANCH_TO_ULOK[getParentBranch(resolvedCabang)] || prev.lokasiCabang,
+              lokasiTanggal,
+              lokasiManual,
+              isRenovasi: isRenovasi,
+              lingkupPekerjaan: resolvedScope,
+              cabang: resolvedCabang || prev.cabang,
+              proyek: finalProyek,
+              namaToko: tokoRef.nama_toko || data["nama_toko"] || data["Nama_Toko"] || prev.namaToko,
+              alamat: fetchedTokoAlamat || tokoRef.alamat || data["Alamat"] || prev.alamat,
+              alamatCabang: tokoRef.alamat_cabang || data["alamat_cabang"] || data["Alamat Cabang"] || prev.alamatCabang,
+              kategoriLokasi: finalKategori,
+              durasiPekerjaan: finalDurasi,
+              luasAreaParkir: rabRef.luas_area_parkir?.toString() || data["Luas Area Parkir"]?.toString() || prev.luasAreaParkir,
+              luasAreaSales: rabRef.luas_area_sales?.toString() || data["Luas Area Sales"]?.toString() || prev.luasAreaSales,
+              luasGudang: rabRef.luas_gudang?.toString() || data["Luas Gudang"]?.toString() || prev.luasGudang,
+              luasBangunan: rabRef.luas_bangunan?.toString() || data["Luas Bangunan"]?.toString() || prev.luasBangunan,
+              luasAreaTerbuka: rabRef.luas_area_terbuka?.toString() || data["Luas Area Terbuka"]?.toString() || prev.luasAreaTerbuka,
+              noPolis: rabRef.no_polis || data["no_polis"] || prev.noPolis,
+              berlakuPolis: rabRef.berlaku_polis || data["berlaku_polis"] || prev.berlakuPolis,
+              fileAsuransi: rabRef.file_asuransi || data["file_asuransi"] || prev.fileAsuransi,
+              logo: rabRef.logo || data["logo"] || prev.logo,
+          }));
+          
+          if (rabRef.logo || data["logo"]) {
+              setLogoPreview(rabRef.logo || data["logo"]);
+          }
+
+          setCurrentRabId(data.id || rabRef.id || null);
+
+          // Restore asuransi file name indicator if file data exists
+          const loadedFileAsuransi = rabRef.file_asuransi || data["file_asuransi"];
+          if (loadedFileAsuransi) {
+              setAsuransiFileName("File Asuransi (dari revisi)");
+          }
+
+          const newRows: any[] = [];
+          if (Array.isArray(itemsData) && itemsData.length > 0) {
+              // Format dari backend baru
+              itemsData.forEach((item: any, i: number) => {
+                  const category = item.kategori_pekerjaan;
+                  const jobName = item.jenis_pekerjaan;
+                  
+                  const itemPriceRef = getPriceItemsForCategory(fetchedPrices, category).find((x: any) => x["Jenis Pekerjaan"] === jobName);
+                  const { isMatCond, isUpahCond } = getManualPriceFlags(itemPriceRef);
+
+                  newRows.push({
+                      id: Date.now() + i + Math.random(),
+                      sourceItemId: item.id ? Number(item.id) : null,
+                      category: category,
+                      jenisPekerjaan: jobName,
+                      satuan: item.satuan || itemPriceRef?.["Satuan"],
+                      volume: parseFloat(item.volume) || 0,
+                      hargaMaterial: parseFloat(item.harga_material) || 0,
+                      hargaUpah: parseFloat(item.harga_upah) || 0,
+                      isKondisional: isMatCond || isUpahCond,
+                      isMaterialKondisional: isMatCond,
+                      isUpahKondisional: isUpahCond,
+                      catatan: item.catatan || ''
+                  });
+              });
+          } else {
+              // Fallback format API lama (kolom 1-200)
+              const details = itemsData;
+              for (let i = 1; i <= 200; i++) {
+                  if (details[`Jenis_Pekerjaan_${i}`]) {
+                      const category = details[`Kategori_Pekerjaan_${i}`];
+                      const jobName = details[`Jenis_Pekerjaan_${i}`];
+                      
+                      const itemPriceRef = getPriceItemsForCategory(fetchedPrices, category).find((x: any) => x["Jenis Pekerjaan"] === jobName);
+                      const { isMatCond, isUpahCond } = getManualPriceFlags(itemPriceRef);
+
+                      newRows.push({
+                          id: Date.now() + i + Math.random(),
+                          sourceItemId: null,
+                          category: category,
+                          jenisPekerjaan: jobName,
+                          satuan: details[`Satuan_Item_${i}`] || itemPriceRef?.["Satuan"],
+                          volume: parseFloat(details[`Volume_Item_${i}`]) || 0,
+                          hargaMaterial: parseFloat(details[`Harga_Material_Item_${i}`]) || 0,
+                          hargaUpah: parseFloat(details[`Harga_Upah_Item_${i}`]) || 0,
+                          isKondisional: isMatCond || isUpahCond,
+                          isMaterialKondisional: isMatCond,
+                          isUpahKondisional: isUpahCond,
+                          catatan: details[`Catatan_Item_${i}`] || ''
+                      });
+                  }
+              }
+          }
+          const revisionOriginalRows = newRows;
+          const rowsToDisplay = usesRabParentPrice(resolvedCabang)
+              ? refreshRevisionRowsWithMasterPrices(newRows, fetchedPrices)
+              : newRows;
+
+          setTableRows(rowsToDisplay);
+          setRevisionItemOriginals(
+              revisionOriginalRows.reduce((acc: Record<number, RevisionComparableRow>, row) => {
+                  const sourceItemId = Number(row.sourceItemId);
+                  if (Number.isFinite(sourceItemId) && sourceItemId > 0 && revisionNotes[sourceItemId]) {
+                      acc[sourceItemId] = toComparableRevisionRow(row);
+                  }
+                  return acc;
+              }, {})
+          );
+          setInitialFormState("TRACKING_PENDING");
+          showAlert("Berhasil", "Data revisi berhasil dimuat ke dalam form.", "success");
+      } catch (err) {
+          showAlert("Error", "Terjadi kesalahan saat memuat data revisi.", "error");
+      } finally {
+          setIsRevisionLoading(false);
+      }
+  };
+
+  useEffect(() => {
+    if (!requestedRevisionId || autoLoadedRevisionId === requestedRevisionId) return;
+    setAutoLoadedRevisionId(requestedRevisionId);
+    setRevisionListDialogOpen(false);
+    handleLoadRevision({ id: requestedRevisionId });
+    // handleLoadRevision intentionally stays outside deps because it reads the latest form state
+    // and is only triggered once per URL revision id.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [requestedRevisionId, autoLoadedRevisionId]);
+
+  const handleLogoChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.size > 2 * 1024 * 1024) {
+      showAlert("Peringatan", "Ukuran logo maksimal 2MB.", "error");
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      const base64 = reader.result as string;
+      setLogoPreview(base64);
+      setFormData(prev => ({ ...prev, logo: base64 }));
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const removeLogo = () => {
+    setLogoPreview(null);
+    setFormData(prev => ({ ...prev, logo: '' }));
+    if (fileInputRef.current) {
+      fileInputRef.current.value = ""; // Reset internal value so same file can be re-uploaded
+    }
+  };
+
+  const handleUploadClick = () => {
+    if (fileInputRef.current) fileInputRef.current.click();
+  };
+
+  const handleTakeoverUlokSelect = (selectedUlok: string) => {
+    if (!selectedUlok) return;
+    const toko = tokoListOptions.find(t => t.nomor_ulok === selectedUlok);
+    
+    const isRenov = selectedUlok.toUpperCase().endsWith('-R');
+    const parts = selectedUlok.split('-');
+    
+    setFormData(prev => ({
+      ...prev,
+      lokasiCabang: parts[0] || prev.lokasiCabang,
+      lokasiTanggal: parts[1] || '',
+      lokasiManual: parts[2] || '',
+      isRenovasi: isRenov,
+      proyek: toko?.proyek || (isRenov ? 'Renovasi Perluasan' : 'Reguler'),
+      namaToko: toko?.nama_toko || prev.namaToko,
+      alamat: toko?.alamat || prev.alamat,
+      cabang: toko?.cabang || prev.cabang
+    }));
+  };
+
+  const handleAsuransiFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.size > 5 * 1024 * 1024) {
+      showAlert("Peringatan", "Ukuran file asuransi maksimal 5MB.", "error");
+      return;
+    }
+
+    // Simpan File object asli untuk dikirim sebagai multipart
+    setAsuransiFile(file);
+    setAsuransiFileName(file.name);
+    setFormData(prev => ({ ...prev, fileAsuransi: '' })); // Kosongkan string, file akan dikirim via multipart
+  };
+
+  const removeAsuransiFile = () => {
+    setAsuransiFileName(null);
+    setAsuransiFile(null);
+    setFormData(prev => ({ ...prev, fileAsuransi: '' }));
+    if (asuransiFileRef.current) {
+      asuransiFileRef.current.value = "";
+    }
+  };
+
+  // --- 5. KALKULASI REAKTIF ---
+  const luasTerbangun = useMemo(() => {
+    return (parseFloat(formData.luasBangunan) || 0) + ((parseFloat(formData.luasAreaTerbuka) || 0) / 2);
+  }, [formData.luasBangunan, formData.luasAreaTerbuka]);
+
+  const totalEstimasi = useMemo(() => {
+    return tableRows.reduce((acc, row) => acc + (volumeToNumber(row.volume) * (row.hargaMaterial + row.hargaUpah)), 0);
+  }, [tableRows]);
+  
+  const pembulatan = Math.floor(totalEstimasi / 10000) * 10000;
+  const isNoPpn = formData.cabang === 'BATAM' || formData.cabang === 'BINTAN';
+  const ppn = isNoPpn ? 0 : pembulatan * 0.11;
+  const grandTotal = pembulatan + ppn;
+
+  // --- 6. HANDLER INPUT NORMAL ---
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const { name, value, type, checked } = e.target;
+    let finalValue = type === 'checkbox' ? checked : value;
+    if (name === 'lokasiManual') {
+        finalValue = formData.isRenovasi ? String(finalValue).replace(/[^a-zA-Z0-9]/g, '').toUpperCase() : String(finalValue).replace(/[^0-9]/g, '');
+    }
+    if (name === 'durasiPekerjaan') {
+        finalValue = normalizeIntegerInput(String(finalValue));
+    }
+    if (decimalFormFields.has(name)) {
+        finalValue = normalizeDecimalInput(String(finalValue));
+    }
+    if (name === 'lokasiTanggal' || name === 'lokasiManual') {
+        crossScopePrefillKeyRef.current = null;
+        setCrossScopeProjectLocked(false);
+    }
+    setFormData(prev => ({ ...prev, [name]: finalValue }));
+    // Jika user mengubah ULOK secara manual, hapus projek_planning_id dari URL
+    // supaya tidak ter-submit sebagai permintaan Project Planning
+    if ((name === 'lokasiTanggal' || name === 'lokasiManual') && hasProjectPlanningRequest) {
+        const newUrl = new URL(window.location.href);
+        newUrl.searchParams.delete('projek_planning_id');
+        newUrl.searchParams.delete('lingkup');
+        window.history.replaceState({}, '', newUrl.toString());
+        setPlanningRequestOverridden(true);
+    }
+  };
+
+  const handleSelectChange = (name: string, value: string) => {
+      setFormData(prev => ({ ...prev, [name]: value }));
+      if (name === 'lingkupPekerjaan') {
+          crossScopePrefillKeyRef.current = null;
+          setCrossScopeProjectLocked(false);
+          // Hanya reset tabel jika user manual mengganti dropdown scope dari form
+          setTableRows([]);
+      }
+  };
+
+  const addRow = (category: string) => {
+    setTableRows(prev => [...prev, { id: Date.now() + Math.random(), category, jenisPekerjaan: '', satuan: '', volume: 0, hargaMaterial: 0, hargaUpah: 0, isKondisional: false, isMaterialKondisional: false, isUpahKondisional: false, catatan: '' }]);
+  };
+
+  const removeRow = (id: number) => setTableRows(prev => prev.filter(row => row.id !== id));
+
+  const updateRow = (id: number, field: string, value: any) => {
+    setTableRows(prev => prev.map(row => {
+      if (row.id === id) {
+        let updatedRow = { ...row, [field]: value };
+        if (field === 'jenisPekerjaan' && value) {
+            const itemData = getPriceItemsForCategory(prices, row.category).find((item: any) => item["Jenis Pekerjaan"] === value);
+            if (itemData) {
+                updatedRow.satuan = itemData["Satuan"];
+                const materialDirectiveToUpah = isTextPriceDirective(itemData["Harga Material"]);
+                const isMatCond = !materialDirectiveToUpah && (
+                  isManualInputFlag(itemData["Input Material Manual"]) ||
+                  isConditionalPriceValue(itemData["Harga Material"])
+                );
+                const isUpahCond =
+                  materialDirectiveToUpah ||
+                  isManualInputFlag(itemData["Input Upah Manual"]) ||
+                  isConditionalPriceValue(itemData["Harga Upah"]);
+                
+                updatedRow.isKondisional = isMatCond || isUpahCond;
+                updatedRow.isMaterialKondisional = isMatCond;
+                updatedRow.isUpahKondisional = isUpahCond;
+                updatedRow.hargaMaterial = materialDirectiveToUpah ? 0 : isMatCond ? 0 : priceValueToNumber(itemData["Harga Material"], row.hargaMaterial);
+                updatedRow.hargaUpah = isUpahCond ? 0 : priceValueToNumber(itemData["Harga Upah"], row.hargaUpah);
+                if (updatedRow.satuan === 'Ls') updatedRow.volume = 1;
+            }
+        }
+        return updatedRow;
+      }
+      return row;
+    }));
+  };
+
+  // --- 7. SUBMIT DATA MENGGUNAKAN API SERVICE ---
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (isReadOnly) {
+      showAlert("Akses Ditolak", "Role ini hanya memiliki akses view.", "warning");
+      return;
+    }
+    if (!isFormModified) {
+      showAlert("Belum ada perubahan", "Silakan buat perubahan pada form atau item pekerjaan terlebih dahulu.", "warning");
+      return;
+    }
+    if (hasUnchangedRevisionItems) {
+      showAlert(
+        "Item revisi belum diubah",
+        "Setiap item yang diminta revisi wajib memiliki minimal 1 perubahan sebelum bisa lanjut.",
+        "warning"
+      );
+      return;
+    }
+    if (!isFormComplete) {
+      showAlert(
+        "Data belum lengkap",
+        submitDisabledReason || "Lengkapi data wajib proyek, dimensi, asuransi, dan item pekerjaan terlebih dahulu.",
+        "warning"
+      );
+      return;
+    }
+    if (luasTerbangun <= 0) return showAlert("Peringatan", "Luas Terbangun tidak boleh kosong.", "error");
+    if (formData.lokasiCabang.length < 4 || formData.lokasiTanggal.length !== 4 || formData.lokasiManual.length !== 4) return showAlert("Peringatan", "Format Nomor Ulok belum lengkap.", "error");
+
+    setIsLoading(true);
+
+    // Filter dan petakan baris tabel menjadi array detail_items
+    const detailItems = tableRows
+      .filter(row => row.jenisPekerjaan && volumeToNumber(row.volume) > 0)
+      .map(row => ({
+        kategori_pekerjaan: row.category,
+        jenis_pekerjaan: row.jenisPekerjaan,
+        satuan: row.satuan,
+        volume: volumeToNumber(row.volume),
+        harga_material: Number(row.hargaMaterial),
+        harga_upah: Number(row.hargaUpah),
+        catatan: row.catatan || ''
+      }));
+
+    if (detailItems.length === 0) {
+      setIsLoading(false);
+      return showAlert("Peringatan", "Minimal harus ada 1 item pekerjaan dengan volume.", "warning");
+    }
+
+    const conditionalItemsWithoutNotes = tableRows.filter(row => 
+        row.jenisPekerjaan && volumeToNumber(row.volume) > 0 && row.isKondisional && (!row.catatan || row.catatan.trim() === '')
+    );
+    if (conditionalItemsWithoutNotes.length > 0) {
+       setIsLoading(false);
+       return showAlert("Peringatan", "Item pekerjaan kondisional wajib mengisi catatan tambahan. Silakan periksa kembali rincian RAB Anda.", "warning");
+    }
+
+    const isRevisionSubmit = currentRabId !== null;
+    if (isRevisionSubmit) {
+      const revisionItemIds = Object.keys(revisionItemNotes)
+        .map(Number)
+        .filter(itemId => Number.isFinite(itemId) && itemId > 0);
+
+      const unchangedRevisionItems = revisionItemIds.filter(itemId => {
+        const currentRow = tableRows.find(row => Number(row.sourceItemId) === itemId);
+        return !currentRow || !isRevisionRowChanged(currentRow, revisionItemOriginals[itemId]);
+      });
+
+      if (unchangedRevisionItems.length > 0) {
+        setIsLoading(false);
+        return showAlert(
+          "Item revisi belum diubah",
+          "Setiap item yang diminta revisi wajib memiliki minimal 1 perubahan sebelum bisa lanjut.",
+          "warning"
+        );
+      }
+    }
+
+    const sessionNamaPt = (sessionStorage.getItem("nama_pt") || "").trim();
+    const sessionEmail = (sessionStorage.getItem("loggedInUserEmail") || "").trim();
+
+    if (!sessionNamaPt || sessionNamaPt === "-" || sessionNamaPt.toUpperCase() === "NAMA PT TIDAK DITEMUKAN") {
+      setIsLoading(false);
+      return showAlert(
+        "Data PT/CV belum lengkap",
+        "Nama PT/CV akun belum terisi. Silakan periksa mapping user cabang sebelum submit RAB agar kop surat dan approval tidak salah.",
+        "error"
+      );
+    }
+
+    // Build payload — gunakan multipart/form-data jika ada file asuransi
+    const textFields: Record<string, string> = {
+      nomor_ulok: getUlokString(),
+      nama_toko: formData.namaToko,
+      proyek: formData.proyek,
+      cabang: formData.cabang,
+      alamat: formData.alamat,
+      alamat_cabang: formData.alamatCabang || '',
+      nama_kontraktor: sessionNamaPt,
+      lingkup_pekerjaan: formData.lingkupPekerjaan.toUpperCase(),
+      email_pembuat: sessionEmail,
+      nama_pt: sessionNamaPt,
+      durasi_pekerjaan: String(formData.durasiPekerjaan),
+      kategori_lokasi: formData.kategoriLokasi.toUpperCase(),
+      luas_bangunan: decimalPayloadValue(formData.luasBangunan),
+      luas_terbangun: String(luasTerbangun.toFixed(2)),
+      luas_area_terbuka: decimalPayloadValue(formData.luasAreaTerbuka),
+      luas_area_parkir: decimalPayloadValue(formData.luasAreaParkir),
+      luas_area_sales: decimalPayloadValue(formData.luasAreaSales),
+      luas_gudang: decimalPayloadValue(formData.luasGudang),
+      no_polis: formData.noPolis,
+      berlaku_polis: formData.berlakuPolis,
+      is_revisi: String(!!isRevisionSubmit),
+      is_takeover: String(!!formData.isTakeover),
+    };
+
+    if (hasProjectPlanningRequest) {
+      textFields.projek_planning_id = String(requestedPlanningId);
+    }
+
+    if (isRevisionSubmit && currentRabId) {
+      textFields.id_rab_revisi = String(currentRabId);
+    }
+
+    if (formData.logo) {
+      if (isRevisionSubmit) {
+        textFields.rev_logo = formData.logo;
+      } else {
+        textFields.logo = formData.logo;
+      }
+    }
+
+    // Jika ada URL lama dari revisi (bukan file baru), kirim sebagai string
+    if (!asuransiFile && formData.fileAsuransi) {
+      if (isRevisionSubmit) {
+        textFields.rev_file_asuransi = formData.fileAsuransi;
+      } else {
+        textFields.file_asuransi = formData.fileAsuransi;
+      }
+    }
+
+    // ==========================================
+    // CONSOLE LOG UNTUK DEBUGGING PAYLOAD
+    // ==========================================
+    console.log("🚀 PAYLOAD SUBMIT RAB (text fields):", textFields);
+    console.log("🚀 DETAIL ITEMS:", detailItems);
+    if (asuransiFile) console.log("📎 FILE ASURANSI:", asuransiFile.name, asuransiFile.size);
+
+    try {
+        // Simpan response API ke dalam variabel submitRes
+        const submitRes = await submitRABData(textFields, detailItems, asuransiFile);
+        
+        // Hapus draft setelah submit berhasil
+        draftAutosaveDisabledRef.current = true;
+        if (sessionEmail) {
+          localStorage.removeItem(`rab_draft_${sessionEmail}`);
+          if (user?.role && user?.cabang) {
+            localStorage.removeItem(`rab_draft_${sessionEmail}_${user.role}_${user.cabang}`);
+          }
+        }
+
+        // Tangkap id_toko dari data response API
+        const idToko = submitRes.data?.id_toko;
+
+        // Tambahkan id_toko dan id (rab) ke dalam parameter URL!
+        const params = new URLSearchParams();
+        if (idToko) params.append('id_toko', String(idToko));
+        if (submitRes.data?.id) params.append('id_rab', String(submitRes.data.id));
+        params.append('locked', currentRabId !== null ? 'false' : 'true');
+        
+        showAlert("Berhasil", "RAB berhasil disimpan. Lanjut buat Gantt Chart agar RAB masuk proses approval.", "success");
+        // Reset state revisi agar tidak terbawa ke halaman lain
+        setCurrentRabId(null);
+        setRevisionItemNotes({});
+        setRevisionItemOriginals({});
+        setTimeout(() => { router.push(`/gantt?${params.toString()}`); }, 1500);
+    } catch (err: any) {
+        setIsLoading(false);
+        // Jika error terjadi saat mode revisi, reset currentRabId agar user bisa
+        // memulai ulang tanpa terjebak dalam mode revisi yang sudah tidak valid
+        if (currentRabId !== null) {
+            const errMsg: string = err.message || '';
+            // Reset mode revisi jika RAB revisi sudah tidak dalam status rejected
+            // (bisa terjadi jika RAB di-approve/diproses pihak lain saat user sedang mengisi form)
+            if (
+                errMsg.includes('bukan status ditolak') ||
+                errMsg.includes('tidak dalam status reject') ||
+                errMsg.includes('sudah dalam proses approval') ||
+                errMsg.includes('tidak ditemukan')
+            ) {
+                setCurrentRabId(null);
+                setRevisionItemNotes({});
+                setRevisionItemOriginals({});
+                showAlert(
+                    "Error",
+                    errMsg + "\n\nForm revisi telah direset. Silakan cek daftar RAB Anda terlebih dahulu sebelum mencoba submit ulang.",
+                    "error"
+                );
+                return;
+            }
+        }
+        showAlert("Error", err.message, "error");
+    }
+  };
+
+  const showAlert = (title: string, desc: string, type: "info" | "error" | "success" | "warning") => {
+    setAlertMessage({ title, desc, type }); 
+    setTimeout(() => setAlertOpen(true), 200);
+  };
+
+  const getAlertStyle = () => {
+    if (alertMessage.type === 'error') return { bgIcon: 'bg-red-100 text-red-600', btn: 'bg-red-600 hover:bg-red-700' };
+    if (alertMessage.type === 'warning') return { bgIcon: 'bg-amber-100 text-amber-600', btn: 'bg-amber-500 hover:bg-amber-600' };
+    if (alertMessage.type === 'success') return { bgIcon: 'bg-green-100 text-green-600', btn: 'bg-green-600 hover:bg-green-700' };
+    return { bgIcon: 'bg-blue-100 text-blue-600', btn: 'bg-blue-600 hover:bg-blue-700' };
+  };
+
+  const activeCategories = formData.lingkupPekerjaan === 'Sipil' ? SIPIL_CATEGORIES : formData.lingkupPekerjaan === 'ME' ? ME_CATEGORIES : [];
+
+  const isRevisionSubmitMode = currentRabId !== null;
+  const isInsuranceComplete = isRevisionSubmitMode || (
+    formData.noPolis.trim() !== '' &&
+    formData.berlakuPolis.trim() !== '' &&
+    (formData.fileAsuransi !== '' || asuransiFile !== null)
+  );
+  const hasValidWorkItem = tableRows.some(row => row.jenisPekerjaan && volumeToNumber(row.volume) > 0);
+
+  const isFormComplete = 
+    formData.namaToko.trim() !== '' &&
+    formData.lokasiTanggal.trim() !== '' &&
+    formData.lokasiManual.trim() !== '' &&
+    formData.proyek !== '' &&
+    formData.proyek !== 'Renovasi' &&
+    formData.alamat.trim() !== '' &&
+    formData.lingkupPekerjaan !== '' &&
+    formData.kategoriLokasi !== '' &&
+    formData.durasiPekerjaan !== '' &&
+    isInsuranceComplete &&
+    formData.luasBangunan !== '' &&
+    formData.luasAreaTerbuka !== '' &&
+    formData.luasAreaSales !== '' &&
+    formData.luasGudang !== '' &&
+    formData.luasAreaParkir !== '' &&
+    hasValidWorkItem;
+
+  const submitDisabledReason = hasUnchangedRevisionItems
+    ? "Setiap item revisi wajib diubah minimal 1 field."
+    : !isFormModified
+      ? "Silakan buat perubahan pada form terlebih dahulu."
+      : !isFormComplete
+        ? (formData.proyek === 'Renovasi' ? "Silakan pilih spesifikasi jenis proyek renovasi Anda." : "Lengkapi data wajib proyek, dimensi, asuransi, dan minimal 1 item pekerjaan bervolume.")
+        : "";
+  const isProjectFieldLocked = isReadOnly || crossScopeProjectLocked;
+  const projectInputClass = crossScopeProjectLocked
+    ? "bg-slate-100 text-slate-600 font-semibold cursor-not-allowed border-slate-200"
+    : "bg-white";
+
+  return (
+    <div className="min-h-screen bg-slate-50 font-sans pb-12">
+      
+      {/* Menggunakan AppNavbar, dengan memasukkan tombol Lonceng ke prop rightActions */}
+      <AppNavbar 
+        title="Rencana Anggaran Biaya"
+        showBackButton={true}
+        backHref="/dashboard"
+        rightActions={
+          <div className="flex items-center gap-1">
+            {isContractor && (
+              <button
+                onClick={() => setPlanningRequestDialogOpen(true)}
+                className="relative p-2 rounded-full hover:bg-white/20 transition-colors focus:outline-none"
+                title="Lihat Permintaan RAB Project Planning"
+              >
+                <ClipboardList className="w-6 h-6 drop-shadow-md text-white" />
+                {planningRequests.length > 0 && (
+                  <span className="absolute top-0 right-0 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-white transform translate-x-1/4 -translate-y-1/4 bg-blue-500 border-2 border-red-700 rounded-full">
+                    {planningRequests.length}
+                  </span>
+                )}
+              </button>
+            )}
+            <button
+              onClick={() => setRevisionListDialogOpen(true)}
+              className="relative p-2 rounded-full hover:bg-white/20 transition-colors focus:outline-none"
+              title="Lihat Daftar Revisi"
+            >
+              <Bell className="w-6 h-6 drop-shadow-md text-white" />
+              {rejectedList.length > 0 && (
+                <span className="absolute top-0 right-0 inline-flex items-center justify-center px-2 py-1 text-xs font-bold leading-none text-white transform translate-x-1/4 -translate-y-1/4 bg-yellow-500 border-2 border-red-700 rounded-full">
+                  {rejectedList.length}
+                </span>
+              )}
+            </button>
+          </div>
+        }
+      />
+
+      <main className="max-w-350 mx-auto p-4 md:p-8 mt-4">
+        <LoadingOverlay
+          isVisible={isRevisionLoading || planningPrefillLoading}
+          title={planningPrefillLoading ? "Memuat Permintaan Project Planning..." : "Memuat Data Revisi..."}
+          subtitle="Mempersiapkan rincian form Anda"
+        />
+
+        {hasProjectPlanningRequest && (
+          <div className="mb-6 flex items-start gap-3 rounded-xl border border-blue-200 bg-blue-50 p-4 text-sm text-blue-900">
+            <Info className="mt-0.5 h-5 w-5 shrink-0" />
+            <div>
+              <p className="font-bold">Form berasal dari Permintaan RAB Project Planning</p>
+              <p className="mt-1 text-blue-700">
+                ULOK, wilayah, dan lingkup dikunci. Lengkapi item pekerjaan, volume, durasi, kategori lokasi, serta data asuransi.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {activeWarnings.length > 0 && (
+          <div className="mb-6 flex items-start gap-3 rounded-xl border-l-4 border-l-red-600 border border-red-200 bg-gradient-to-r from-red-50 to-red-100 p-4 text-red-900 shadow-sm animate-in fade-in slide-in-from-top-2">
+            <AlertTriangle className="mt-0.5 h-6 w-6 shrink-0 text-red-600 animate-pulse" />
+            <div>
+              <p className="font-bold text-red-800 text-base">Peringatan: Status Surat Peringatan Aktif</p>
+              <p className="mt-1 text-red-700 text-sm">
+                Perusahaan Anda saat ini berstatus <strong>SP{Math.max(...activeWarnings.map(sp => sp.sp_level || 0))}</strong>. Harap berikan performa terbaik pada penawaran proyek selanjutnya, dan pastikan Anda meninjau evaluasi sebelumnya di menu Surat Peringatan.
+              </p>
+            </div>
+          </div>
+        )}
+        <form onSubmit={handleSubmit}>
+          <Card className="mb-8 shadow-sm">
+            <CardHeader className="border-b bg-slate-50/50 pb-4"><CardTitle className="text-red-700">Data & Identitas Proyek</CardTitle></CardHeader>
+            <CardContent className="pt-6">
+              {/* --- BAGIAN LOGO PERUSAHAAN --- */}
+              <div className="mb-8 p-6 bg-slate-50 rounded-2xl border-2 border-dashed border-slate-200 flex flex-col md:flex-row items-center gap-8 transition-all hover:border-slate-300">
+                <div className="relative group shrink-0">
+                  <div className={`w-32 h-32 rounded-2xl overflow-hidden shadow-md border-2 border-white flex items-center justify-center bg-white ${!logoPreview ? 'bg-slate-50' : ''}`}>
+                    {logoPreview ? (
+                      <img src={logoPreview} alt="Logo" className="w-full h-full object-contain" />
+                    ) : (
+                      <div className="flex flex-col items-center text-slate-300">
+                        <ImageIcon className="w-10 h-10" />
+                        <span className="text-xs font-bold mt-1 uppercase tracking-tight">Logo</span>
+                      </div>
+                    )}
+                  </div>
+                    {logoPreview && !isReadOnly && (
+                    <button 
+                      type="button" 
+                      onClick={removeLogo}
+                      className="absolute -top-2 -right-2 p-1.5 bg-red-500 text-white rounded-full shadow-lg hover:bg-red-600 transition-transform hover:scale-110 active:scale-95"
+                      title="Hapus Logo"
+                    >
+                      <X className="w-3 h-3" />
+                    </button>
+                  )}
+                </div>
+
+                <div className="flex-1 space-y-2 text-center md:text-left">
+                  <h3 className="font-extrabold text-slate-800 text-lg tracking-tight">Logo Perusahaan</h3>
+                  <p className="text-xs text-slate-500 leading-relaxed">
+                    Unggah logo perusahaan anda untuk dicetak pada dokumen SPH. <br className="hidden md:block" />
+                    Format yang didukung: <b>PNG, JPG, JPEG</b>.
+                  </p>
+                  <div className="pt-2">
+                    {!isReadOnly && (
+                      <label className="inline-flex items-center gap-2 px-4 py-2 bg-white border border-slate-200 rounded-xl shadow-sm text-sm font-bold text-slate-700 cursor-pointer transition-all hover:bg-slate-50 hover:border-slate-300 active:bg-slate-100 group">
+                        <Upload className="w-4 h-4 text-red-500 transition-transform group-hover:-translate-y-0.5" />
+                        {logoPreview ? 'Ganti Logo' : 'Pilih Logo'}
+                        <input 
+                          type="file" 
+                          ref={fileInputRef} 
+                          className="hidden" 
+                          accept="image/*" 
+                          onChange={handleLogoChange} 
+                        />
+                      </label>
+                    )}
+                    {(currentRabId || (formData.logo && formData.logo.startsWith('http'))) && (
+                      <a 
+                        href={currentRabId ? getRABLogoDownloadUrl(currentRabId) : formData.logo} 
+                        target="_blank" 
+                        rel="noopener noreferrer" 
+                        className="inline-flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-600 border border-blue-100 rounded-xl shadow-sm text-sm font-bold hover:bg-blue-100 transition-all ml-2"
+                        title="Lihat/Download Logo Saat Ini"
+                      >
+                        <Download className="w-4 h-4" />
+                        Download Foto
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* --- GRID FORM IDENTITAS --- */}
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <div className="space-y-2">
+                  <Label>Nama Toko <span className="text-red-500">*</span></Label>
+                  <Combobox
+                    disabled={isProjectFieldLocked || isLoadingMaintenanceStores}
+                    value={formData.lokasiManual || null}
+                    inputValue={tokoSearchQuery}
+                    onInputValueChange={(val: any) => {
+                      if (!val) {
+                        setTokoSearchQuery('');
+                        return;
+                      }
+                      // Jika BaseUI mencoba memasukkan value (kode) atau text lainnya ke input saat item dipilih:
+                      // Kita cegat dan paksa kembalikan ke nama tokonya saja.
+                      const matchedStoreByCode = maintenanceStores.find(s => s.code === val);
+                      if (matchedStoreByCode) {
+                        setTokoSearchQuery(matchedStoreByCode.name);
+                      } else {
+                        setTokoSearchQuery(val);
+                      }
+                    }}
+                    onValueChange={(val: any) => {
+                      if (!val) return;
+                      const selectedStore = maintenanceStores.find(s => s.code === val);
+                      if (selectedStore) {
+                        setTokoSearchQuery(selectedStore.name);
+                        setFormData(prev => ({
+                          ...prev,
+                          namaToko: selectedStore.name,
+                          lokasiManual: selectedStore.code,
+                        }));
+                      } else {
+                        setFormData(prev => ({ ...prev, namaToko: val }));
+                      }
+                    }}
+                  >
+                    <ComboboxInput 
+                      placeholder={isLoadingMaintenanceStores ? "Memuat toko..." : "Cari nama / kode toko..."}
+                    />
+                    <ComboboxContent>
+                      {(() => {
+                        const filteredStores = maintenanceStores.filter(store => 
+                          store.name.toLowerCase().includes(tokoSearchQuery.toLowerCase()) || 
+                          store.code.toLowerCase().includes(tokoSearchQuery.toLowerCase())
+                        );
+
+                        if (filteredStores.length === 0) {
+                          return <div className="p-3 text-sm text-center text-muted-foreground">Toko tidak ditemukan</div>;
+                        }
+
+                        return (
+                          <ComboboxList>
+                            {filteredStores.map((store, i) => (
+                              <ComboboxItem key={`${store.code}-${i}`} value={store.code}>
+                                {store.name} - {store.code}
+                              </ComboboxItem>
+                            ))}
+                          </ComboboxList>
+                        );
+                      })()}
+                    </ComboboxContent>
+                  </Combobox>
+                </div>
+                <div className="space-y-2">
+                  <div className="flex items-center space-x-2 mb-2">
+                    <Checkbox id="isRenovasi" disabled={true} checked={true} />
+                    <Label htmlFor="isRenovasi" className="font-normal cursor-pointer mr-4">Proyek Renovasi (Format Baru)</Label>
+                    
+                    {(formData.cabang === 'HEAD OFFICE' || formData.cabang === 'GORONTALO') && (
+                      <>
+                        <Checkbox id="isTakeover" disabled={isProjectFieldLocked || hasProjectPlanningRequest} checked={formData.isTakeover} onCheckedChange={(c) => setFormData(prev => ({...prev, isTakeover: !!c}))}/>
+                        <Label htmlFor="isTakeover" className="font-normal cursor-pointer font-medium text-orange-600">Takeover (Pergantian Kontraktor)</Label>
+                      </>
+                    )}
+                  </div>
+                  <div className="flex gap-2 items-center">
+                    {formData.isTakeover ? (
+                      <Select
+                        disabled={isProjectFieldLocked || hasProjectPlanningRequest || isLoadingToko}
+                        value={formData.lokasiCabang && formData.lokasiTanggal && formData.lokasiManual ? getUlokString() : undefined}
+                        onValueChange={handleTakeoverUlokSelect}
+                      >
+                        <SelectTrigger className={`w-full ${projectInputClass}`}>
+                          <SelectValue placeholder={isLoadingToko ? "Memuat data ulok..." : "Pilih Ulok dari daftar"} />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {tokoListOptions.filter(t => t.has_takeover_inspection).map((toko, i) => (
+                            <SelectItem key={i} value={toko.nomor_ulok}>
+                              {toko.nomor_ulok} - {toko.nama_toko}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <>
+                        <Input name="lokasiCabang" placeholder="Kode" className="w-[30%] bg-slate-100 text-slate-500 font-bold cursor-not-allowed border-slate-200" value={formData.lokasiCabang} readOnly tabIndex={-1} />
+                        <span className="font-bold text-slate-400">-</span>
+                        <Input name="lokasiTanggal" readOnly={isProjectFieldLocked || hasProjectPlanningRequest} placeholder="YYMM" className={`w-[30%] ${projectInputClass}`} maxLength={4} value={formData.lokasiTanggal} onChange={handleInputChange} required />
+                        <span className="font-bold text-slate-400">-</span>
+                        <Input name="lokasiManual" readOnly={isProjectFieldLocked || hasProjectPlanningRequest} placeholder={formData.isRenovasi ? "C0B4" : "0001"} className={`w-[40%] uppercase ${projectInputClass}`} maxLength={4} value={formData.lokasiManual} onChange={handleInputChange} required />
+                        {formData.isRenovasi && (<><span className="font-bold text-slate-400">-</span><Input readOnly value="R" className="w-12 bg-slate-100 text-center font-bold text-slate-500 cursor-not-allowed border-slate-200" tabIndex={-1} /></>)}
+                      </>
+                    )}
+                  </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>Proyek <span className="text-red-500">*</span></Label>
+                  {formData.isRenovasi ? (
+                    <Select 
+                      disabled={isReadOnly || hasProjectPlanningRequest || (crossScopeProjectLocked && !!formData.proyek && formData.proyek !== 'Renovasi')}
+                      value={formData.proyek || undefined} 
+                      onValueChange={(val) => setFormData(prev => ({...prev, proyek: val}))}
+                    >
+                      <SelectTrigger className={projectInputClass}>
+                        <SelectValue placeholder="Pilih Jenis Renovasi" />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="Renovasi Perluasan">Renovasi Perluasan</SelectItem>
+                        <SelectItem value="Renovasi Perpanjangan">Renovasi Perpanjangan</SelectItem>
+                        <SelectItem value="Renovasi Toko Tutup">Renovasi Toko Tutup</SelectItem>
+                        <SelectItem value="Renovasi Peremajaan">Renovasi Peremajaan</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  ) : (
+                    <Input value="Reguler" readOnly className="bg-slate-100 text-slate-600 font-semibold cursor-not-allowed border-slate-200" tabIndex={-1} />
+                  )}
+                </div>
+                <div className="space-y-2 lg:col-span-3"><Label>Alamat Lengkap <span className="text-red-500">*</span></Label><Input name="alamat" readOnly={isProjectFieldLocked} value={formData.alamat} onChange={handleInputChange} placeholder="Masukkan alamat lengkap proyek" className={projectInputClass} required /></div>
+                <div className="space-y-2 lg:col-span-3"><Label>Alamat Wilayah / Office <span className="text-xs text-slate-400 font-normal">(Otomatis dari data wilayah)</span></Label><Input name="alamatCabang" value={formData.alamatCabang || ''} readOnly className="bg-slate-100 text-slate-600 font-semibold cursor-not-allowed border-slate-200" tabIndex={-1} placeholder="-" /></div>
+                
+                <div className="lg:col-span-3 grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+                  <div className="space-y-2">
+                    <Label>Wilayah <span className="text-red-500">*</span></Label>
+                    {availableCabang.length > 1 ? (
+                      <Select 
+                        disabled={isProjectFieldLocked || hasProjectPlanningRequest}
+                        value={formData.cabang} 
+                        onValueChange={(val) => {
+                          const newLokasiCabang = BRANCH_TO_ULOK[getParentBranch(val)] || "KODE";
+                          crossScopePrefillKeyRef.current = null;
+                          setCrossScopeProjectLocked(false);
+                          setFormData(prev => ({ 
+                            ...prev, 
+                            cabang: val, 
+                            lokasiCabang: newLokasiCabang,
+                            isTakeover: (val === 'HEAD OFFICE' || val === 'GORONTALO') ? prev.isTakeover : false
+                          }));
+
+                          const userEmail = sessionStorage.getItem('loggedInUserEmail');
+                          if (userEmail && val) {
+                              checkRevisionStatus(userEmail, val).then(result => {
+                                  if (result.rejected_submissions) {
+                                      setRejectedList(result.rejected_submissions);
+                                      // Jangan membuka modal secara otomatis di sini karena mengganggu UX 
+                                      // dan memicu error WAI-ARIA focus trap saat Select ditutup.
+                                  }
+                              }).catch(err => console.log("Gagal periksa revisi", err));
+                          }
+                        }}
+                      >
+                        <SelectTrigger className={projectInputClass}>
+                          <SelectValue placeholder="-- Pilih Wilayah --" />
+                        </SelectTrigger>
+                        <SelectContent>
+                          {availableCabang.map((c) => (
+                            <SelectItem key={c} value={c}>{c}</SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    ) : (
+                      <Input value={formData.cabang} readOnly className="bg-slate-100 text-slate-600 font-semibold cursor-not-allowed border-slate-200" tabIndex={-1} />
+                    )}
+                  </div>
+                  <div className="space-y-2"><Label>Lingkup Pekerjaan <span className="text-red-500">*</span></Label><Select disabled={isProjectFieldLocked || hasProjectPlanningRequest || !!currentRabId} onValueChange={(val) => handleSelectChange('lingkupPekerjaan', val)} value={formData.lingkupPekerjaan} required><SelectTrigger className={projectInputClass}><SelectValue placeholder="-- Pilih Lingkup Pekerjaan --" /></SelectTrigger><SelectContent><SelectItem value="Sipil">Sipil</SelectItem><SelectItem value="ME">ME</SelectItem></SelectContent></Select></div>
+                  <div className="space-y-2"><Label>Kategori Lokasi <span className="text-red-500">*</span></Label><Select disabled={isProjectFieldLocked} onValueChange={(val) => handleSelectChange('kategoriLokasi', val)} value={formData.kategoriLokasi} required><SelectTrigger className={projectInputClass}><SelectValue placeholder="-- Pilih Kategori Lokasi --" /></SelectTrigger><SelectContent><SelectItem value="Ruko">Ruko</SelectItem><SelectItem value="Non Ruko">Non Ruko</SelectItem></SelectContent></Select></div>
+                  <div className="space-y-2"><Label>Durasi Pekerjaan (Hari) <span className="text-red-500">*</span></Label><Input type="text" inputMode="numeric" pattern="[0-9]*" name="durasiPekerjaan" readOnly={isProjectFieldLocked} value={formData.durasiPekerjaan} onChange={handleInputChange} onKeyDown={preventNativeNumberStep} onWheel={preventWheelNumberChange} placeholder="Masukkan jumlah hari" className={projectInputClass} required /></div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          {/* --- SECTION ASURANSI --- */}
+          <Card className="mb-8 shadow-sm">
+            <CardHeader className="border-b bg-slate-50/50 pb-4"><CardTitle className="text-red-700">Asuransi Proyek</CardTitle></CardHeader>
+            <CardContent className="pt-6">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                <div className="space-y-2">
+                  <Label>No. Polis <span className="text-red-500">*</span></Label>
+                  <Input name="noPolis" readOnly={isProjectFieldLocked} value={formData.noPolis} onChange={handleInputChange} placeholder="Masukkan nomor polis" className={projectInputClass} required />
+                </div>
+                <div className="space-y-2">
+                  <Label>Masa Berlaku <span className="text-red-500">*</span></Label>
+                  {isProjectFieldLocked ? (
+                    <Input readOnly value={formData.berlakuPolis} className="bg-slate-100 text-slate-500 font-semibold cursor-not-allowed border-slate-200" />
+                  ) : (
+                    <DatePicker
+                      value={formData.berlakuPolis}
+                      onChange={val => setFormData(prev => ({ ...prev, berlakuPolis: val }))}
+                    />
+                  )}
+                </div>
+                <div className="space-y-2">
+                  <Label>Upload File Asuransi <span className="text-red-500">*</span></Label>
+                  {asuransiFileName ? (
+                    <div className="flex items-center gap-2 p-2.5 bg-green-50 border border-green-200 rounded-lg">
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm font-semibold text-green-700 truncate">{asuransiFileName}</p>
+                        <p className="text-xs text-green-500">File berhasil diunggah</p>
+                      </div>
+                      {currentRabId && !asuransiFile && (
+                        <a 
+                          href={getRABInsuranceDownloadUrl(currentRabId)} 
+                          target="_blank" 
+                          rel="noopener noreferrer"
+                          className="p-1.5 bg-blue-100 text-blue-600 rounded-full hover:bg-blue-200 transition-colors shrink-0" 
+                          title="Download File Asuransi Saat Ini"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                        </a>
+                      )}
+                      {!isProjectFieldLocked && (
+                        <button type="button" onClick={removeAsuransiFile} className="p-1.5 bg-red-100 text-red-500 rounded-full hover:bg-red-200 transition-colors shrink-0" title="Hapus file">
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  ) : (
+                    !isProjectFieldLocked ? (
+                      <label className="flex items-center gap-2 px-4 py-2.5 bg-white border border-slate-200 rounded-lg shadow-sm text-sm font-bold text-slate-700 cursor-pointer transition-all hover:bg-slate-50 hover:border-slate-300 active:bg-slate-100 group">
+                        <Upload className="w-4 h-4 text-red-500 transition-transform group-hover:-translate-y-0.5" />
+                        Pilih File
+                        <input
+                          type="file"
+                          ref={asuransiFileRef}
+                          className="hidden"
+                          accept=".pdf"
+                          onChange={handleAsuransiFileChange}
+                        />
+                      </label>
+                    ) : (
+                      <div className="p-2 bg-slate-100 text-slate-500 text-sm border rounded-lg">Belum diunggah</div>
+                    )
+                  )}
+                  <p className="text-xs text-slate-400">Format: PDF (Maks. 10MB)</p>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card className="mb-8 shadow-sm">
+            <CardHeader className="border-b bg-slate-50/50 pb-4"><CardTitle className="text-red-700">Dimensi & Ukuran Proyek</CardTitle></CardHeader>
+            <CardContent className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-6 pt-6">
+              <div className="space-y-2"><Label>Luas Bangunan (m²) <span className="text-red-500">*</span></Label><Input type="text" inputMode="decimal" name="luasBangunan" readOnly={isProjectFieldLocked} value={formData.luasBangunan} onChange={handleInputChange} onKeyDown={preventNativeNumberStep} onWheel={preventWheelNumberChange} placeholder="0.00" className={projectInputClass} required /></div>
+              <div className="space-y-2"><Label>Luas Area Terbuka (m²) <span className="text-red-500">*</span></Label><Input type="text" inputMode="decimal" name="luasAreaTerbuka" readOnly={isProjectFieldLocked} value={formData.luasAreaTerbuka} onChange={handleInputChange} onKeyDown={preventNativeNumberStep} onWheel={preventWheelNumberChange} placeholder="0.00" className={projectInputClass} required /></div>
+              <div className="space-y-2"><Label>Luas Area Sales (m²) <span className="text-red-500">*</span></Label><Input type="text" inputMode="decimal" name="luasAreaSales" readOnly={isProjectFieldLocked} value={formData.luasAreaSales} onChange={handleInputChange} onKeyDown={preventNativeNumberStep} onWheel={preventWheelNumberChange} placeholder="0.00" className={projectInputClass} required /></div>
+              <div className="space-y-2"><Label>Luas Gudang (m²) <span className="text-red-500">*</span></Label><Input type="text" inputMode="decimal" name="luasGudang" readOnly={isProjectFieldLocked} value={formData.luasGudang} onChange={handleInputChange} onKeyDown={preventNativeNumberStep} onWheel={preventWheelNumberChange} placeholder="0.00" className={projectInputClass} required /></div>
+              <div className="space-y-2"><Label>Luas Area Parkir (m²) <span className="text-red-500">*</span></Label><Input type="text" inputMode="decimal" name="luasAreaParkir" readOnly={isProjectFieldLocked} value={formData.luasAreaParkir} onChange={handleInputChange} onKeyDown={preventNativeNumberStep} onWheel={preventWheelNumberChange} placeholder="0.00" className={projectInputClass} required /></div>
+              <div className="space-y-2"><Label className="text-blue-700 font-bold">Luas Terbangun (m²) <span className="text-xs font-normal text-slate-400">(Auto)</span></Label><Input readOnly value={luasTerbangun > 0 ? luasTerbangun.toFixed(2) : ''} className="bg-blue-50 border-blue-200 font-bold text-blue-800 cursor-not-allowed" placeholder="0.00" tabIndex={-1} /></div>
+            </CardContent>
+          </Card>
+
+          {activeCategories.length > 0 && (
+            <div className="space-y-6 mb-8">
+              {(revisionRejectReason || Object.keys(revisionItemNotes).length > 0) && (
+                <Card className="border-red-200 bg-red-50/60 shadow-sm">
+                  <CardContent className="p-4 space-y-3">
+                    {revisionRejectReason && (
+                      <div className="flex gap-3">
+                        <div className="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-red-100 text-red-700">
+                          <AlertTriangle className="h-4 w-4" />
+                        </div>
+                        <div className="min-w-0">
+                          <p className="text-sm font-bold text-red-800">Alasan Penolakan RAB</p>
+                          <p className="mt-1 whitespace-pre-wrap text-sm leading-relaxed text-red-700">{revisionRejectReason}</p>
+                        </div>
+                      </div>
+                    )}
+                    {Object.keys(revisionItemNotes).length > 0 && (
+                      <div className="rounded-lg border border-red-100 bg-white px-3 py-2 text-xs text-slate-600">
+                        Catatan item revisi ditampilkan langsung pada baris pekerjaan yang perlu diperbaiki.
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
+              )}
+              <h2 className="text-xl font-bold text-slate-800 border-b-2 border-red-500 pb-2 inline-block">Detail Bill of Quantities (BoQ)</h2>
+              {activeCategories.map((category) => {
+                const itemsInCategory = tableRows.filter(r => r.category === category);
+                const subTotal = itemsInCategory.reduce((acc, row) => acc + (volumeToNumber(row.volume) * (row.hargaMaterial + row.hargaUpah)), 0);
+                const selectedJobs = itemsInCategory.map(r => r.jenisPekerjaan).filter(Boolean);
+
+                return (
+                  <Card key={category} className="overflow-hidden border-slate-200 shadow-sm">
+                    <div className="bg-slate-100 p-4 border-b flex justify-between items-center">
+                      <h3 className="font-bold text-red-700">{category}</h3>
+                    </div>
+                    {itemsInCategory.length > 0 && (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm text-left border-collapse min-w-275">
+                          <thead className="bg-red-50 text-red-700 text-xs text-center border-b border-red-200">
+                            <tr>
+                              <th rowSpan={2} className="p-2 border border-red-100 whitespace-nowrap">No</th>
+                              <th rowSpan={2} className="p-2 border border-red-100 whitespace-nowrap">Jenis Pekerjaan</th>
+                              <th rowSpan={2} className="p-2 border border-red-100 whitespace-nowrap">Satuan</th>
+                              <th rowSpan={2} className="p-2 border border-red-100 whitespace-nowrap">Volume (a)</th>
+                              <th colSpan={2} className="p-2 border border-red-100 whitespace-nowrap">Harga Satuan (Rp)</th>
+                              <th colSpan={2} className="p-2 border border-red-100 whitespace-nowrap">Total Harga Satuan (Rp)</th>
+                              <th rowSpan={2} className="p-2 border border-red-100 whitespace-nowrap">Total Harga (Rp)<br/><span className="font-normal">(f=d+e)</span></th>
+                              <th rowSpan={2} className="p-2 border border-red-100 min-w-48">Catatan Tambahan<br/><span className="font-normal">(Wajib jika Kondisional)</span></th>
+                              <th rowSpan={2} className="p-2 border border-red-100 whitespace-nowrap">Aksi</th>
+                            </tr>
+                            <tr>
+                              <th className="p-2 border border-red-100 bg-red-50/50 whitespace-nowrap">Material (b)</th><th className="p-2 border border-red-100 bg-red-50/50 whitespace-nowrap">Upah (c)</th>
+                              <th className="p-2 border border-red-100 bg-red-50/50 whitespace-nowrap">Material (d=a×b)</th><th className="p-2 border border-red-100 bg-red-50/50 whitespace-nowrap">Upah (e=a×c)</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {itemsInCategory.map((row, index) => {
+                              const itemRevisionNote = row.sourceItemId ? revisionItemNotes[Number(row.sourceItemId)] : '';
+                              const priceDirective = getPriceDirectiveForRow(prices, row);
+                              const canEditMaterialPrice = priceDirective.isMaterialEditable;
+                              const canEditUpahPrice = priceDirective.isUpahEditable;
+                              const priceItems = getPriceItemsForCategory(prices, category);
+                              const hasCurrentJobOption = priceItems.some((p) => p["Jenis Pekerjaan"] === row.jenisPekerjaan);
+                              return (
+                              <tr key={row.id} className={`hover:bg-slate-50 transition-colors border-b border-slate-100 ${itemRevisionNote ? 'bg-red-50/30' : ''}`}>
+                                <td className="p-2 border-r border-slate-100 text-center font-medium text-slate-500 whitespace-nowrap">{index + 1}</td>
+                                <td className="p-2 border-r border-slate-100 whitespace-nowrap">
+                                  <select disabled={isReadOnly} className="w-full p-2 border border-slate-300 rounded-md bg-white focus:border-blue-500 focus:ring-1 focus:ring-blue-500 outline-none text-xs" value={row.jenisPekerjaan} onKeyDown={preventSelectArrowChange} onChange={(e) => updateRow(row.id, 'jenisPekerjaan', e.target.value)}>
+                                    <option value="">-- Pilih --</option>
+                                    {row.jenisPekerjaan && !hasCurrentJobOption && (
+                                      <option value={row.jenisPekerjaan}>{row.jenisPekerjaan}</option>
+                                    )}
+                                    {priceItems.map((p: any) => {
+                                        const jobName = p["Jenis Pekerjaan"];
+                                        const isSelectedElsewhere = selectedJobs.includes(jobName) && row.jenisPekerjaan !== jobName;
+                                        return <option key={jobName} value={jobName} title={jobName} disabled={isSelectedElsewhere} className={isSelectedElsewhere ? "text-slate-300 bg-slate-50" : ""}>{jobName}</option>;
+                                    })}
+                                  </select>
+                                  {itemRevisionNote && (
+                                    <div className="mt-2 rounded-md border border-red-200 bg-red-50 px-2 py-1.5 text-xs leading-relaxed text-red-700 whitespace-normal">
+                                      <span className="font-bold">Catatan revisi item:</span> {itemRevisionNote}
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="p-2 border-r border-slate-100 text-center text-slate-600 font-medium whitespace-nowrap">{row.satuan}</td>
+                                <td className="p-2 border-r border-slate-100 whitespace-nowrap"><Input type="text" inputMode="decimal" className={`h-9 px-2 text-center transition-colors text-xs w-24 ${isReadOnly || row.satuan === 'Ls' ? 'bg-slate-100 text-slate-500 cursor-not-allowed border-slate-200' : 'bg-white border-slate-300 focus-visible:ring-blue-500 font-medium text-slate-800'}`} value={volumeToInputValue(row.volume)} onChange={(e) => updateRow(row.id, 'volume', normalizeVolumeInput(e.target.value))} onBlur={(e) => updateRow(row.id, 'volume', normalizeVolumeOnBlur(e.target.value))} onKeyDown={preventNativeNumberStep} onWheel={preventWheelNumberChange} placeholder="0" readOnly={isReadOnly || row.satuan === 'Ls'} /></td>
+                                <td className="p-2 border-r border-slate-100 whitespace-nowrap"><Input type="text" className={`h-9 px-2 text-right transition-colors text-xs w-28 ${isReadOnly || !canEditMaterialPrice ? 'bg-slate-100 text-slate-500 cursor-not-allowed border-slate-200' : 'bg-yellow-50 border-yellow-300 focus-visible:ring-yellow-500 text-yellow-900 font-bold'}`} value={formatAngka(row.hargaMaterial)} onChange={(e) => updateRow(row.id, 'hargaMaterial', parseFloat(e.target.value.replace(/\./g, '')) || 0)} readOnly={isReadOnly || !canEditMaterialPrice} tabIndex={canEditMaterialPrice ? 0 : -1} /></td>
+                                <td className="p-2 border-r border-slate-100 whitespace-nowrap"><Input type="text" className={`h-9 px-2 text-right transition-colors text-xs w-28 ${isReadOnly || !canEditUpahPrice ? 'bg-slate-100 text-slate-500 cursor-not-allowed border-slate-200' : 'bg-yellow-50 border-yellow-300 focus-visible:ring-yellow-500 text-yellow-900 font-bold'}`} value={formatAngka(row.hargaUpah)} onChange={(e) => updateRow(row.id, 'hargaUpah', parseFloat(e.target.value.replace(/\./g, '')) || 0)} readOnly={isReadOnly || !canEditUpahPrice} tabIndex={canEditUpahPrice ? 0 : -1} /></td>
+                                <td className="p-2 border-r border-slate-100 bg-slate-50 text-right text-slate-600 font-medium text-xs whitespace-nowrap">{toRupiah(volumeToNumber(row.volume) * row.hargaMaterial)}</td>
+                                <td className="p-2 border-r border-slate-100 bg-slate-50 text-right text-slate-600 font-medium text-xs whitespace-nowrap">{toRupiah(volumeToNumber(row.volume) * row.hargaUpah)}</td>
+                                <td className="p-2 border-r border-slate-100 text-right font-bold text-slate-800 bg-slate-100 text-xs whitespace-nowrap">{toRupiah(volumeToNumber(row.volume) * (row.hargaMaterial + row.hargaUpah))}</td>
+                                <td className="p-2 border-r border-slate-100 min-w-48"><Textarea placeholder={row.isKondisional ? "Wajib isi detail pekerjaan..." : "Catatan..."} disabled={isReadOnly} className={`min-h-9 py-1 px-2 text-xs border-slate-300 focus-visible:ring-blue-500 resize-y ${row.isKondisional && (!row.catatan || row.catatan.trim() === '') ? 'bg-red-50 border-red-300 focus-visible:ring-red-500 placeholder:text-red-400' : 'bg-white'}`} value={row.catatan || ''} onChange={(e) => updateRow(row.id, 'catatan', e.target.value)} /></td>
+                                <td className="p-2 text-center whitespace-nowrap">
+                                  {!isReadOnly && (
+                                    <Button type="button" variant="ghost" size="icon" className="h-8 w-8 text-slate-400 hover:text-red-600 hover:bg-red-50" onClick={() => removeRow(row.id)}><Trash2 className="w-4 h-4" /></Button>
+                                  )}
+                                </td>
+                              </tr>
+                            )})}
+                          </tbody>
+                          <tfoot className="bg-slate-50 border-t-2 border-slate-200">
+                             {!isReadOnly && (
+                               <tr>
+                                 <td colSpan={11} className="p-3 text-center bg-white border-b border-slate-200">
+                                   <Button type="button" size="sm" variant="outline" className="h-8 bg-white border-dashed border-red-300 text-red-600 hover:bg-red-50 hover:border-red-400 w-full max-w-sm" onClick={() => addRow(category)}><Plus className="w-4 h-4 mr-1" /> Tambah Item Pekerjaan</Button>
+                                 </td>
+                               </tr>
+                             )}
+                            <tr><td colSpan={8} className="p-3 text-right font-bold text-slate-600">Sub Total {category}:</td><td className="p-3 text-right font-bold text-red-700 whitespace-nowrap">{toRupiah(subTotal)}</td><td colSpan={2}></td></tr>
+                          </tfoot>
+                        </table>
+                      </div>
+                    )}
+                    {itemsInCategory.length === 0 && !isReadOnly && (
+                        <div className="p-6 text-center">
+                            <Button type="button" size="sm" variant="outline" className="h-8 bg-white border-dashed border-red-300 text-red-600 hover:bg-red-50 hover:border-red-400" onClick={() => addRow(category)}><Plus className="w-4 h-4 mr-1" /> Tambah Item Pekerjaan</Button>
+                        </div>
+                    )}
+                  </Card>
+                )
+              })}
+            </div>
+          )}
+
+          <div className="bg-[#fff9e6] border-2 border-[#ffc107] p-6 md:p-8 rounded-2xl shadow-sm mb-8">
+              <div className="flex justify-between items-center mb-3"><span className="text-slate-600 font-medium">Total Estimasi :</span><span className="font-semibold text-lg text-slate-800">{toRupiah(totalEstimasi)}</span></div>
+              
+              {isNoPpn ? (
+                <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-t border-yellow-300 pt-6 gap-4 mt-4">
+                  <span className="text-xl md:text-2xl font-bold text-slate-800">PEMBULATAN</span>
+                  <span className="text-3xl md:text-4xl font-extrabold text-red-600">{toRupiah(pembulatan)}</span>
+                </div>
+              ) : (
+                <>
+                  <div className="flex justify-between items-center mb-3"><span className="text-slate-600 font-medium">Pembulatan :</span><span className="font-semibold text-lg text-slate-800">{toRupiah(pembulatan)}</span></div>
+                  <div className="flex justify-between items-center mb-6"><span className="text-slate-600 font-medium">PPN (11%) :</span><span className="font-semibold text-lg text-slate-800">{toRupiah(ppn)}</span></div>
+                  <div className="flex flex-col md:flex-row justify-between items-start md:items-center border-t border-yellow-300 pt-6 gap-4"><span className="text-xl md:text-2xl font-bold text-slate-800">GRAND TOTAL</span><span className="text-3xl md:text-4xl font-extrabold text-red-600">{toRupiah(grandTotal)}</span></div>
+                </>
+              )}
+          </div>
+
+          {!isReadOnly && (
+            <div className="sticky bottom-4 z-10 p-4 bg-white/80 backdrop-blur-md rounded-2xl shadow-lg border border-slate-200">
+              {submitDisabledReason && !isLoading && (
+                <p className="mb-3 text-center text-xs font-semibold text-amber-700">{submitDisabledReason}</p>
+              )}
+              <div className="flex flex-col md:flex-row gap-4">
+                <Button type="submit" disabled={isLoading || isReadOnly} title={submitDisabledReason} className="w-full md:flex-1 h-14 text-lg font-bold bg-red-600 hover:bg-red-700 disabled:bg-slate-300 disabled:text-slate-500 shadow-md transition-all">
+                  {isLoading ? <><Loader2 className="w-5 h-5 mr-2 animate-spin" /> Sedang Mengirim Data...</> : <><Save className="w-5 h-5 mr-2" /> Simpan & Lanjut ke Gantt Chart</>}
+                </Button>
+              <Button type="button" variant="outline" className="w-full md:w-1/3 h-14 text-lg font-semibold bg-white border-slate-300 text-slate-700 hover:bg-slate-50 hover:text-red-600" onClick={() => setResetDialogOpen(true)}>
+                Reset Ulang Form
+              </Button>
+              </div>
+            </div>
+          )}
+        </form>
+      </main>
+
+      <AlertDialog open={planningRequestDialogOpen} onOpenChange={setPlanningRequestDialogOpen}>
+        <AlertDialogContent className="rounded-2xl max-w-4xl max-h-[82vh] overflow-y-auto">
+          <AlertDialogHeader>
+            <div className="flex items-center gap-3 border-b pb-3 mb-3">
+              <div className="bg-blue-100 text-blue-600 p-2 rounded-full">
+                <ClipboardList className="w-6 h-6" />
+              </div>
+              <div className="flex-1">
+                <AlertDialogTitle className="text-lg">Permintaan RAB Project Planning</AlertDialogTitle>
+                <AlertDialogDescription className="mt-1 text-left text-slate-500">
+                  ULOK berikut sedang membutuhkan penawaran Sipil/ME untuk melanjutkan Project Planning.
+                </AlertDialogDescription>
+              </div>
+              {planningRequests.length > 0 && (
+                <span className="rounded-full bg-blue-600 px-2.5 py-1 text-xs font-bold text-white">
+                  {planningRequests.length}
+                </span>
+              )}
+            </div>
+          </AlertDialogHeader>
+
+          {planningRequestsLoading ? (
+            <div className="flex items-center justify-center gap-2 py-10 text-sm text-slate-500">
+              <Loader2 className="h-4 w-4 animate-spin" /> Memuat permintaan wilayah...
+            </div>
+          ) : planningRequests.length === 0 ? (
+            <div className="rounded-xl border border-slate-200 bg-slate-50 py-10 text-center text-sm text-slate-500">
+              Tidak ada ULOK Project Planning yang membutuhkan RAB saat ini.
+            </div>
+          ) : (
+            <div className="grid gap-3 md:grid-cols-2">
+              {planningRequests.map((request) => (
+                <div
+                  key={`${request.projek_planning_id}-${request.lingkup_pekerjaan}`}
+                  className="rounded-xl border border-blue-100 bg-white p-4 shadow-sm"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <p className="font-extrabold text-slate-900">{request.nomor_ulok}</p>
+                      <p className="mt-1 text-sm text-slate-600">
+                        {request.nama_toko || request.nama_lokasi || 'Nama toko belum tersedia'}
+                      </p>
+                    </div>
+                    <span className={`rounded-full px-2.5 py-1 text-xs font-bold ${
+                      request.lingkup_pekerjaan === 'SIPIL'
+                        ? 'bg-orange-100 text-orange-700'
+                        : 'bg-cyan-100 text-cyan-700'
+                    }`}>
+                      {request.lingkup_pekerjaan}
+                    </span>
+                  </div>
+                  <p className="mt-2 text-xs text-slate-500">Wilayah {request.cabang || '-'}</p>
+                  <Button
+                    type="button"
+                    className="mt-4 w-full bg-blue-600 hover:bg-blue-700"
+                    onClick={() => {
+                      setPlanningRequestDialogOpen(false);
+                      window.location.href = `/rab?projek_planning_id=${request.projek_planning_id}&lingkup=${request.lingkup_pekerjaan}`;
+                    }}
+                  >
+                    Buat Penawaran <ArrowRight className="ml-2 h-4 w-4" />
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <AlertDialogFooter className="mt-4">
+            <AlertDialogAction className="w-full bg-slate-800 hover:bg-slate-900" onClick={() => setPlanningRequestDialogOpen(false)}>
+              Tutup Notifikasi
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={revisionListDialogOpen} onOpenChange={setRevisionListDialogOpen}>
+        <AlertDialogContent className="rounded-2xl max-w-md max-h-[80vh] overflow-y-auto">
+          <AlertDialogHeader>
+            <div className="flex items-center gap-3 border-b pb-3 mb-3">
+              <div className="bg-amber-100 text-amber-600 p-2 rounded-full">
+                  <Bell className="w-6 h-6" />
+              </div>
+              <AlertDialogTitle className="text-lg">Daftar Pekerjaan Revisi</AlertDialogTitle>
+            </div>
+            <AlertDialogDescription className="text-left text-slate-600">
+              {rejectedList.length > 0 ? (
+                  <span className="block space-y-4">
+                      <span className="block text-sm">Berikut adalah daftar Nomor Ulok yang dikembalikan dan perlu Anda revisi/ajukan ulang:</span>
+                      <span className="flex flex-col space-y-3">
+                          {rejectedList.map((item, idx) => (
+                              <span key={idx} className="bg-amber-50 p-4 rounded-xl border border-amber-200 flex flex-col gap-3">
+                                  <span className="block">
+                                      <span className="font-bold text-slate-800 text-base">{item['Nomor Ulok']}</span>
+                                      <span className="text-sm text-slate-500 block">Lingkup Pekerjaan: {item.lingkup_pekerjaan || item['Lingkup_Pekerjaan'] || item['Lingkup Pekerjaan']}</span>
+                                      <span className="text-sm text-slate-500 block">Proyek: {item['Proyek'] || '-'}</span>
+                                      <span className="text-sm text-slate-500 block">Nama Toko: {item.nama_toko || '-'}</span>
+                                      {item.alasan_penolakan && (
+                                          <span className="text-sm font-medium text-red-600 block mt-2 bg-red-50 p-2.5 rounded-lg border border-red-100">
+                                              <span className="font-bold">Alasan Penolakan:</span> {item.alasan_penolakan}
+                                          </span>
+                                      )}
+                                  </span>
+                                  <Button 
+                                      className="w-full bg-amber-500 hover:bg-amber-600 text-white font-bold"
+                                      onClick={() => {
+                                          setRevisionListDialogOpen(false);
+                                          window.location.href = `/rab?revision_id=${item.id}`;
+                                      }}
+                                  >
+                                      Revisi Sekarang
+                                  </Button>
+                              </span>
+                          ))}
+                      </span>
+                  </span>
+              ) : (
+                  <span className="block text-center py-6 text-slate-500">Hebat! Tidak ada data pekerjaan yang perlu direvisi saat ini.</span>
+              )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="mt-4">
+            <AlertDialogAction className="w-full bg-slate-800 hover:bg-slate-900" onClick={() => setRevisionListDialogOpen(false)}>Tutup Notifikasi</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* MODAL ALERT UMUM */}
+      <AlertDialog open={alertOpen} onOpenChange={setAlertOpen}>
+        <AlertDialogContent className="rounded-2xl max-w-sm text-center">
+          <AlertDialogHeader>
+            <div className={`mx-auto w-16 h-16 flex items-center justify-center rounded-full mb-4 ${getAlertStyle().bgIcon}`}>
+              {alertMessage.type === 'warning' ? <AlertTriangle className="w-8 h-8" /> : <Info className="w-8 h-8" />}
+            </div>
+            <AlertDialogTitle className="text-center">{alertMessage.title}</AlertDialogTitle>
+            <AlertDialogDescription className="text-center">{alertMessage.desc}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="sm:justify-center">
+            <AlertDialogAction className={`w-full ${getAlertStyle().btn}`} onClick={() => setAlertOpen(false)}>Mengerti</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* MODAL KONFIRMASI LOAD REVISI SAAT NGETIK ULOK DIHAPUS */}
+
+      {/* MODAL LOAD DRAFT */}
+      <AlertDialog open={draftDialogOpen} onOpenChange={setDraftDialogOpen}>
+        <AlertDialogContent className="rounded-2xl max-w-sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Draft Tersimpan Ditemukan</AlertDialogTitle>
+            <AlertDialogDescription>
+              Sistem menemukan data pengisian RAB yang belum selesai dari sesi sebelumnya. Apakah Anda ingin melanjutkan pengisian dari draft ini?
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={deleteDraft}>Abaikan & Hapus</AlertDialogCancel>
+            <AlertDialogAction onClick={loadDraft} className="bg-blue-600 hover:bg-blue-700 text-white">Lanjutkan Draft</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {/* MODAL KONFIRMASI RESET FORM */}
+      <AlertDialog open={resetDialogOpen} onOpenChange={setResetDialogOpen}>
+        <AlertDialogContent className="rounded-2xl max-w-sm">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Konfirmasi Reset Form</AlertDialogTitle>
+            <AlertDialogDescription>Apakah Anda yakin ingin mereset seluruh data form ini?</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel onClick={() => setResetDialogOpen(false)}>Batal</AlertDialogCancel>
+            <AlertDialogAction onClick={() => window.location.reload()} className="bg-red-600 hover:bg-red-700 text-white">Ya, Reset Form</AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+    </div>
+  );
+}
+
+export default function RABPage() {
+  return (
+    <Suspense fallback={<LoadingOverlay isVisible title="Memuat Penawaran..." subtitle="Menyiapkan halaman RAB" />}>
+      <RABPageContent />
+    </Suspense>
+  );
+}

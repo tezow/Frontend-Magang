@@ -1,0 +1,69 @@
+import type { Metadata, Viewport } from "next";
+import { Geist, Geist_Mono } from "next/font/google";
+import "./globals.css";
+import ServiceWorkerRegister from "@/components/ServiceWorkerRegister";
+
+const geistSans = Geist({
+  variable: "--font-sans",
+  subsets: ["latin"],
+});
+
+const geistMono = Geist_Mono({
+  variable: "--font-geist-mono",
+  subsets: ["latin"],
+});
+
+export const metadata: Metadata = {
+  title: "SPARTA Building",
+  description: "Sistem Pemantauan dan Administrasi Real-time Toko Alfamart",
+  appleWebApp: {
+    capable: true,
+    statusBarStyle: "default",
+    title: "SPARTA Building",
+  },
+  formatDetection: {
+    telephone: false,
+  },
+};
+
+export const viewport: Viewport = {
+  themeColor: "#dc2626",
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+};
+
+import { GlobalAlertProvider } from "@/context/GlobalAlertContext";
+import { GlobalAlert } from "@/components/GlobalAlert";
+import ErrorReporter from "@/components/ErrorReporter";
+import { SessionProvider } from "@/context/SessionContext";
+import { cn } from "@/lib/utils";
+import WebPushManager from "@/components/WebPushManager";
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode;
+}>) {
+  return (
+    <html lang="id" className={cn("font-sans", geistSans.variable)}>
+      <head>
+        <link rel="apple-touch-icon" href="/icon-192x192.png" />
+      </head>
+      <body
+        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
+      >
+        <GlobalAlertProvider>
+          <SessionProvider>
+            {children}
+            <WebPushManager />
+          </SessionProvider>
+          <ErrorReporter />
+          <GlobalAlert />
+        </GlobalAlertProvider>
+        <ServiceWorkerRegister />
+      </body>
+    </html>
+  );
+}

@@ -1,0 +1,587 @@
+import React, { useEffect, useState } from 'react';
+import { fetchDashboardAll, viewGeneratedPdfOnline } from '@/lib/api';
+import { API_URL, formatProjectPlanningStatus } from '@/lib/constants';
+import { formatRupiah } from '@/lib/utils';
+import { CheckCircle2, Clock, Activity, HardHat, FileCheck, Search, FileText, Loader2, ExternalLink, ChevronDown, ClipboardList, Building2 } from 'lucide-react';
+
+export function KpiTimeline({ nomor_ulok, lingkup_pekerjaan, hideHeader }: { nomor_ulok: string; lingkup_pekerjaan?: string | null; hideHeader?: boolean }) {
+    const [project, setProject] = useState<any>(null);
+    const [projects, setProjects] = useState<any[]>([]);
+    const [isLoading, setIsLoading] = useState(true);
+    const [expandedNode, setExpandedNode] = useState<number | null>(null);
+    const selectedScope = String(lingkup_pekerjaan ?? "").trim().toUpperCase();
+
+    useEffect(() => {
+        const load = async () => {
+            try {
+                setIsLoading(true);
+                const res = await fetchDashboardAll(nomor_ulok);
+                if (res?.status === "success" && res.data && res.data.length > 0) {
+                    setProjects(res.data);
+                    const scopedProject = selectedScope
+                        ? res.data.find((item: any) => String(item?.toko?.lingkup_pekerjaan ?? "").trim().toUpperCase() === selectedScope)
+                        : null;
+                    setProject(scopedProject ?? res.data[0]);
+                } else {
+                    setProjects([]);
+                    setProject(null);
+                }
+            } catch (error) {
+                console.error("Failed to load project for timeline", error);
+            } finally {
+                setIsLoading(false);
+            }
+        };
+        load();
+    }, [nomor_ulok, selectedScope]);
+
+    const getProxyUrl = (url: string) => {
+        if (!url || typeof url !== 'string' || !url.startsWith('http')) return url;
+        return `${API_URL.replace(/\/$/, "")}/api/denda/actions/proxy-file?url=${encodeURIComponent(url)}`;
+    };
+
+    const normalizeDateKey = (value: unknown) => {
+        const raw = String(value ?? '').trim();
+        if (!raw) return '';
+        if (/^\d{2}\/\d{2}\/\d{4}$/.test(raw)) {
+            const [day, month, year] = raw.split('/');
+            return `${year}-${month}-${day}`;
+        }
+        return raw.split(/[T ]/)[0];
+    };
+
+    const formatDateLabel = (value: unknown) => {
+        const key = normalizeDateKey(value);
+        if (!key) return '-';
+        const parsed = new Date(`${key}T00:00:00`);
+        return Number.isNaN(parsed.getTime()) ? key : parsed.toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' });
+    };
+
+    const timestampValue = (value: unknown) => {
+        const date = value ? new Date(String(value)) : null;
+        return date && !Number.isNaN(date.getTime()) ? date.getTime() : 0;
+    };
+
+    const documentDateValue = (value: unknown) => timestampValue(value) || timestampValue(`${normalizeDateKey(value)}T00:00:00`);
+
+    const latestTambahSpk = projects
+        .flatMap((item: any) => (item.spk || []).flatMap((spk: any) => (spk.pertambahan_spk || []).map((tambah: any) => ({
+            ...tambah,
+            _scope: item.toko?.lingkup_pekerjaan || spk.lingkup_pekerjaan || null,
+            _spkEndDate: Math.max(
+                documentDateValue(tambah.tanggal_spk_akhir_setelah_perpanjangan),
+                documentDateValue(tambah.tanggal_spk_akhir)
+            ),
+            _documentDate: Math.max(
+                documentDateValue(tambah.waktu_persetujuan),
+                documentDateValue(tambah.created_at)
+            )
+        }))))
+        .filter((tambah: any) => tambah.link_pdf || tambah.link_lampiran_pendukung || tambah.pertambahan_hari)
+        .sort((a: any, b: any) => (b._spkEndDate - a._spkEndDate) || (b._documentDate - a._documentDate))[0] ?? null;
+
+    const openPengawasanDocument = async (sub: any) => {
+        const idPengawasanGantt = Number(sub.idPengawasanGantt);
+        if (Number.isFinite(idPengawasanGantt) && idPengawasanGantt > 0) {
+            await viewGeneratedPdfOnline(idPengawasanGantt, 'PENGAWASAN' as any);
+            return;
+        }
+
+        if (sub.url) {
+            window.open(getProxyUrl(sub.url), '_blank', 'noopener,noreferrer');
+        }
+    };
+
+    if (isLoading) {
+        return (
+            <div className="flex flex-col items-center justify-center p-10 space-y-4">
+                <Loader2 className="h-8 w-8 animate-spin text-red-500" />
+                <p className="text-sm font-medium text-slate-500">Memuat Timeline Projek...</p>
+            </div>
+        );
+    }
+
+    if (!project) {
+        return (
+            <div className="flex items-center justify-center p-10">
+                <p className="text-sm font-medium text-slate-500">Data projek tidak ditemukan untuk timeline.</p>
+            </div>
+        );
+    }
+
+    const nodes: any[] = [];
+    const proj = project;
+    const scope = proj.toko?.lingkup_pekerjaan || '';
+    const suffix = scope ? ` (${scope})` : '';
+
+    // 0. Project Planning (FPD)
+    const ppList = (proj.project_planning && Array.isArray(proj.project_planning)) ? proj.project_planning : [];
+    let ppData = ppList.length > 0 ? ppList[0] : null;
+    if (!ppData && projects && projects.length > 0) {
+        const counterpart = projects.find((p: any) => p.toko?.nomor_ulok === proj.toko?.nomor_ulok && p.project_planning?.length > 0);
+        if (counterpart) {
+            ppData = counterpart.project_planning[0];
+        }
+    }
+    if (ppData) {
+        const ppMeta = formatProjectPlanningStatus(ppData.status);
+        const ppDates = [];
+        if (ppData.tanggal_dokumen || ppData.created_at) {
+            ppDates.push({ label: 'Dibuat', val: ppData.tanggal_dokumen || ppData.created_at });
+        }
+        const latestApprove = ppData.pp_manager_waktu_persetujuan || ppData.pp2_waktu_persetujuan || ppData.bm_regional_waktu_persetujuan || ppData.bm2_waktu_persetujuan || ppData.pp1_waktu_persetujuan || ppData.bm_waktu_persetujuan || ppData.approved_at_rm || ppData.approved_at_manager || ppData.approved_at_specialist || ppData.approved_at_bm;
+        if (latestApprove) {
+            ppDates.push({ label: 'Approve', val: latestApprove });
+        }
+
+        const ppSubItems = Number(ppData.total_foto_dokumentasi) > 0 ? [
+            {
+                title: 'PDF Dokumen FPD',
+                desc: 'Laporan FPD Project Planning',
+                url: ppData.link_pdf || null,
+                id: ppData.id,
+                type: 'PROJECT_PLANNING'
+            },
+            {
+                title: 'PDF Lampiran Foto Dokumentasi',
+                desc: `${ppData.total_foto_dokumentasi} Foto Survei`,
+                id: ppData.id,
+                type: 'PROJECT_PLANNING_PHOTOS'
+            }
+        ] : undefined;
+
+        nodes.push({
+            type: 'PROJECT_PLANNING',
+            title: `Project Planning${suffix}`,
+            desc: ppData.estimasi_biaya ? formatRupiah(ppData.estimasi_biaya) : ppMeta.label,
+            icon: <ClipboardList className="w-5 h-5"/>,
+            color: ppMeta.timelineColor,
+            data: ppData,
+            isActive: true,
+            isCompleted: ['COMPLETED', 'SELESAI', 'APPROVED'].includes(String(ppData.status || '').toUpperCase()),
+            url: ppData.link_pdf || null,
+            subItems: ppSubItems,
+            dateList: ppDates
+        });
+    }
+
+    // 1. RAB
+    const hasRab = proj.rab && proj.rab.length > 0;
+    nodes.push({
+        type: 'PENAWARAN',
+        title: `Penawaran RAB${suffix}`,
+        desc: hasRab ? formatRupiah(proj.rab[0].grand_total_final) : 'Belum Tersedia',
+        icon: <FileText className="w-5 h-5"/>,
+        color: hasRab ? 'indigo' : 'slate',
+        data: hasRab ? proj.rab[0] : null,
+        isActive: hasRab,
+        isCompleted: hasRab,
+        url: hasRab ? proj.rab[0].link_pdf_gabungan : null,
+        dateList: hasRab ? [
+            { label: 'Dibuat', val: proj.rab[0].created_at },
+            { label: 'Approve', val: proj.rab[0].waktu_persetujuan_direktur }
+        ] : []
+    });
+
+    // 2. SPK
+    const hasSpk = proj.spk && proj.spk.length > 0;
+    nodes.push({
+        type: 'SPK',
+        title: `Surat Perintah Kerja${suffix}`,
+        desc: hasSpk ? formatRupiah(proj.spk[0].grand_total) : 'Belum Tersedia',
+        icon: <HardHat className="w-5 h-5"/>,
+        color: hasSpk ? 'blue' : 'slate',
+        data: hasSpk ? proj.spk[0] : null,
+        isActive: hasSpk,
+        isCompleted: hasSpk,
+        url: hasSpk ? proj.spk[0].link_pdf : null,
+        dateList: hasSpk ? [
+            { label: 'Mulai', val: proj.spk[0].waktu_mulai },
+            { label: 'Selesai', val: proj.spk[0].waktu_selesai }
+        ] : []
+    });
+
+    // 3. Tambah SPK (ULOK gabungan: pakai tanggal akhir SPK paling jauh lintas lingkup)
+    if (latestTambahSpk) {
+        nodes.push({
+            type: 'Tambah SPK',
+            title: `Tambah SPK`,
+            desc: `${latestTambahSpk.pertambahan_hari ?? '-'} Hari`,
+            icon: <Clock className="w-5 h-5"/>,
+            color: 'cyan',
+            data: latestTambahSpk,
+            isActive: true,
+            isCompleted: true,
+            url: latestTambahSpk.link_pdf || latestTambahSpk.link_lampiran_pendukung || null,
+            dateList: [
+                { label: 'Mulai Ext', val: latestTambahSpk.created_at },
+                { label: 'Selesai Ext', val: latestTambahSpk.tanggal_spk_akhir_setelah_perpanjangan || latestTambahSpk.tanggal_spk_akhir }
+            ]
+        });
+    }
+
+    // 4. Instruksi Lapangan (Only if exists)
+    const hasIL = proj.instruksi_lapangan && proj.instruksi_lapangan.length > 0;
+    const totalIL = hasIL ? proj.instruksi_lapangan.reduce((sum: number, il: any) => sum + (Number(il.grand_total) || 0), 0) : 0;
+    
+    let ilSubItems: any[] = [];
+    if (hasIL) {
+        ilSubItems = proj.instruksi_lapangan.filter((il: any) => il.link_pdf_gabungan || il.link_pdf_non_sbo).map((il: any, idx: number) => ({
+            title: `Instruksi Lapangan ${idx + 1}`,
+            desc: new Date(il.created_at).toLocaleDateString('id-ID', { day: 'numeric', month: 'long', year: 'numeric' }),
+            url: il.link_pdf_gabungan || il.link_pdf_non_sbo
+        }));
+        
+        nodes.push({
+            type: 'IL_ROOT',
+            title: `Instruksi Lapangan${suffix}`,
+            desc: formatRupiah(totalIL),
+            icon: <Activity className="w-5 h-5"/>,
+            color: 'orange',
+            data: { isILRoot: true, projectData: proj },
+            isActive: true,
+            isCompleted: true,
+            url: null,
+            subItems: ilSubItems.length > 0 ? ilSubItems : undefined
+        });
+    }
+
+    // 5. Pengawasan
+    let hasPengawasan = false;
+    let pengawasanProgress = 0, pengawasanTerlambat = 0;
+    
+    const pengawasanSubItems: any[] = [];
+
+    const seenPengawasan = new Set<string>();
+
+    projects.forEach((projectItem: any) => {
+        (projectItem.gantt || []).forEach((g: any) => {
+            if (!Array.isArray(g.pengawasan_gantt)) return;
+
+            g.pengawasan_gantt.forEach((pg: any) => {
+            const groupItems = (g.pengawasan || []).filter((pw: any) => pw.id_pengawasan_gantt === pg.id);
+            if (groupItems.length === 0) return;
+
+            const pw = groupItems[0];
+            const dateKey = normalizeDateKey(pg.tanggal_pengawasan || pw.tanggal_pengawasan || pw.created_at);
+            const matchPdf = (g.berkas_pengawasan || []).find((bp: any) => bp.id_pengawasan_gantt === pg.id);
+            const pendingMatch = projectItem.pengawasan_pdf_pending && Array.isArray(projectItem.pengawasan_pdf_pending)
+                ? projectItem.pengawasan_pdf_pending.find((p: any) => normalizeDateKey(p.tanggal_pengawasan) === dateKey)
+                : null;
+            const pengawasanUrl = pendingMatch?.link_pdf_pengawasan || matchPdf?.link_pdf_pengawasan || null;
+            const dedupeKey = String(pg.id || pengawasanUrl || (dateKey + '|' + g.id));
+            if (seenPengawasan.has(dedupeKey)) return;
+            seenPengawasan.add(dedupeKey);
+
+            hasPengawasan = true;
+            const isSelesai = groupItems.every((i: any) => ['SELESAI', 'CLOSED', 'DONE', 'SESUAI'].includes((i.status || '').toUpperCase()));
+            const isTerlambat = groupItems.some((i: any) => ['TERLAMBAT', 'LATE'].includes((i.status || '').toUpperCase()));
+            if (!isSelesai && isTerlambat) pengawasanTerlambat++;
+            else if (!isSelesai) pengawasanProgress++;
+
+            const statusDesc = isSelesai ? 'Selesai' : isTerlambat ? 'Terlambat' : 'Progress';
+
+            pengawasanSubItems.push({
+                title: 'Pengawasan - Progress: ' + statusDesc,
+                desc: formatDateLabel(dateKey || pg.tanggal_pengawasan || pw.created_at),
+                url: pengawasanUrl,
+                createdAt: Number(pg.id) || new Date(pw.created_at).getTime(),
+                idGantt: g.id,
+                idPengawasanGantt: pg.id,
+                hasGeneratedFallback: Boolean(pg.id)
+            });
+            });
+        });
+    });
+    
+    pengawasanSubItems.sort((a, b) => a.createdAt - b.createdAt);
+
+    const pSelesai = hasPengawasan && pengawasanProgress === 0 && pengawasanTerlambat === 0;
+    nodes.push({
+        type: 'PENGAWASAN',
+        title: `Pengawasan`,
+        desc: hasPengawasan ? (pSelesai ? 'SELESAI' : pengawasanTerlambat > 0 ? 'TERLAMBAT' : 'PROGRESS') : 'Belum Tersedia',
+        icon: <Search className="w-5 h-5"/>,
+        color: hasPengawasan ? 'purple' : 'slate',
+        data: hasPengawasan ? { isPengawasanRoot: true, ganttData: proj.gantt, projectData: proj } : null,
+        isActive: hasPengawasan,
+        isCompleted: pSelesai,
+        url: null,
+        subItems: pengawasanSubItems.length > 0 ? pengawasanSubItems : undefined
+    });
+
+    // 6. Opname Parsial
+    const allOpnames = proj.opname_final || [];
+    const opnameParsial = allOpnames.filter((o: any) => o.tipe_opname === 'OPNAME' || o.tipe_opname === 'OPNAME_FINAL' || o.tipe_opname === 'KTK');
+    const hasParsial = opnameParsial.length > 0;
+    const parsialData = hasParsial ? opnameParsial[0] : null;
+    const parsialTotal = parsialData ? (parsialData.grand_total_final || parsialData.grand_total_ktk || parsialData.grand_total_opname || parsialData.nilai_opname || 0) : 0;
+    
+    // Fallback to Opname Final / KTK document if parsial document is missing
+    const finalDataFallback = allOpnames.find((o: any) => o.tipe_opname === 'OPNAME_FINAL' || o.tipe_opname === 'KTK');
+    const parsialUrl = parsialData ? (parsialData.link_pdf_opname || finalDataFallback?.link_pdf_opname || null) : null;
+    
+    nodes.push({
+        type: 'Opname Parsial',
+        title: `Opname Parsial${suffix}`,
+        desc: hasParsial ? formatRupiah(parsialTotal) : 'Belum Tersedia',
+        icon: <Activity className="w-5 h-5"/>,
+        color: hasParsial ? 'sky' : 'slate',
+        data: parsialData,
+        isActive: hasParsial,
+        isCompleted: hasParsial,
+        url: parsialUrl,
+        subItems: undefined
+    });
+
+    // 7. Serah Terima
+    const hasST = proj.berkas_serah_terima && proj.berkas_serah_terima.length > 0;
+    nodes.push({
+        type: 'ST',
+        title: `Serah Terima Selesai${suffix}`,
+        desc: hasST ? 'Selesai' : 'Belum Tersedia',
+        icon: <FileCheck className="w-5 h-5"/>,
+        color: hasST ? 'emerald' : 'slate',
+        data: hasST ? proj.berkas_serah_terima[0] : null,
+        isActive: hasST,
+        isCompleted: hasST,
+        url: hasST ? proj.berkas_serah_terima[0].link_pdf : null,
+        dateList: hasST ? [
+            { label: 'Tanggal ST', val: proj.berkas_serah_terima[0].tanggal_serah_terima || proj.berkas_serah_terima[0].created_at }
+        ] : []
+    });
+
+    // 8. Opname Final / KTK
+    const opnameFinal = allOpnames.filter((o: any) => o.tipe_opname !== 'OPNAME');
+    const hasFinal = opnameFinal.length > 0;
+    const opnameStatus = hasFinal ? (() => {
+        const opname = opnameFinal[0];
+        const rab = proj.rab?.[0];
+        const grandFinal = Number(opname.grand_total_final || opname.grand_total_opname || opname.nilai_opname || 0);
+        const grandRab = Number(rab?.grand_total_final || 0);
+        return grandFinal > grandRab ? 'Kerja Tambah' : (grandFinal < grandRab ? 'Kerja Kurang' : 'Sesuai');
+    })() : '';
+    nodes.push({
+        type: 'Opname Final',
+        title: `Opname Final / KTK${suffix}`,
+        desc: hasFinal ? `${formatRupiah(opnameFinal[0].grand_total_final || opnameFinal[0].nilai_opname || 0)} (${opnameStatus})` : 'Belum Tersedia',
+        icon: <CheckCircle2 className="w-5 h-5"/>,
+        color: hasFinal ? 'teal' : 'slate',
+        data: hasFinal ? opnameFinal[0] : null,
+        isActive: hasFinal,
+        isCompleted: hasFinal,
+        url: hasFinal ? opnameFinal[0].link_pdf_opname : null,
+        dateList: hasFinal ? [
+            { label: 'KTK Final', val: opnameFinal[0].created_at },
+            { label: 'Approve Dir', val: opnameFinal[0].waktu_persetujuan_direktur }
+        ] : []
+    });
+
+    // 8.5 Dokumentasi Bangunan Toko Baru (Kondisional Opsi A, berlaku SIPIL + ME)
+    const dokList = (proj.dokumentasi_bangunan && Array.isArray(proj.dokumentasi_bangunan)) ? proj.dokumentasi_bangunan : [];
+    let dokData = dokList.length > 0 ? dokList[0] : null;
+    if (!dokData && projects && projects.length > 0) {
+        const counterpart = projects.find((p: any) => 
+            p.toko?.nomor_ulok === proj.toko?.nomor_ulok && p.dokumentasi_bangunan?.length > 0
+        );
+        if (counterpart) {
+            dokData = counterpart.dokumentasi_bangunan[0];
+        }
+    }
+
+    if (dokData) {
+        const statusUpper = String(dokData.status_validasi || 'SUBMITTED').toUpperCase();
+        nodes.push({
+            type: 'DOKUMENTASI_BANGUNAN',
+            title: 'Dokumentasi Bangunan Toko Baru',
+            desc: `Status: ${statusUpper}`,
+            icon: <Building2 className="w-5 h-5"/>,
+            color: 'amber',
+            data: dokData,
+            isActive: true,
+            isCompleted: true,
+            url: dokData.link_pdf || null,
+            dateList: [
+                { label: 'Ambil Foto', val: dokData.tanggal_ambil_foto },
+                { label: 'Grand Opening', val: dokData.tanggal_go }
+            ].filter((d: any) => Boolean(d.val))
+        });
+    }
+
+    // 9. DONE
+    const isFinalApproved = hasFinal && ['SELESAI', 'APPROVED', 'DONE', 'DISETUJUI'].includes(String(opnameFinal[0].status_opname_final || '').toUpperCase());
+    const isProyekSelesai = hasST && hasFinal && isFinalApproved;
+    nodes.push({
+        type: 'DONE',
+        title: `Proyek Selesai${suffix}`,
+        desc: isProyekSelesai ? 'Tercapai' : 'Belum Tercapai',
+        icon: <CheckCircle2 className="w-5 h-5"/>,
+        color: isProyekSelesai ? 'emerald' : 'slate',
+        data: null,
+        isActive: isProyekSelesai,
+        isCompleted: isProyekSelesai,
+        url: null
+    });
+
+    const getColorClasses = (color: string, isActive: boolean, isCompleted: boolean) => {
+        if (!isActive) return { bg: 'bg-slate-100', text: 'text-slate-400', border: 'border-slate-200 border-l-[6px] border-l-slate-300', dot: 'bg-slate-300' };
+        const maps: any = {
+            indigo: { bg: 'bg-indigo-50', text: 'text-indigo-600', border: 'border-indigo-200 border-l-[6px] border-l-indigo-500', dot: 'bg-indigo-500' },
+            blue: { bg: 'bg-blue-50', text: 'text-blue-600', border: 'border-blue-200 border-l-[6px] border-l-blue-500', dot: 'bg-blue-500' },
+            cyan: { bg: 'bg-cyan-50', text: 'text-cyan-600', border: 'border-cyan-200 border-l-[6px] border-l-cyan-500', dot: 'bg-cyan-500' },
+            orange: { bg: 'bg-orange-50', text: 'text-orange-600', border: 'border-orange-200 border-l-[6px] border-l-orange-500', dot: 'bg-orange-500' },
+            purple: { bg: 'bg-purple-50', text: 'text-purple-600', border: 'border-purple-200 border-l-[6px] border-l-purple-500', dot: 'bg-purple-500' },
+            sky: { bg: 'bg-sky-50', text: 'text-sky-600', border: 'border-sky-200 border-l-[6px] border-l-sky-500', dot: 'bg-sky-500' },
+            emerald: { bg: 'bg-emerald-50', text: 'text-emerald-600', border: 'border-emerald-200 border-l-[6px] border-l-emerald-500', dot: 'bg-emerald-500' },
+            teal: { bg: 'bg-teal-50', text: 'text-teal-600', border: 'border-teal-200 border-l-[6px] border-l-teal-500', dot: 'bg-teal-500' },
+            amber: { bg: 'bg-amber-50', text: 'text-amber-600', border: 'border-amber-200 border-l-[6px] border-l-amber-500', dot: 'bg-amber-500' },
+            slate: { bg: 'bg-slate-50', text: 'text-slate-600', border: 'border-slate-200 border-l-[6px] border-l-slate-400', dot: 'bg-slate-500' }
+        };
+        return maps[color] || maps.slate;
+    };
+
+    return (
+        <div className="w-full flex flex-col items-center">
+            {!hideHeader && (
+                <div className="mb-4 flex items-center justify-between gap-3 w-full">
+                    <div className="flex items-center gap-3">
+                        <div className="h-6 w-1.5 shrink-0 rounded-full bg-red-500" />
+                        <h4 className="text-xl font-bold tracking-tight text-slate-900">Timeline Projek</h4>
+                    </div>
+                </div>
+            )}
+            
+            <div className="w-full max-w-4xl relative pb-10 mt-6">
+                <div className="absolute left-1/2 top-0 bottom-0 w-1 bg-slate-100 -translate-x-1/2 rounded-full hidden md:block"></div>
+                
+                <div className="absolute left-8 top-0 bottom-0 w-1 bg-slate-100 rounded-full md:hidden"></div>
+
+                <div className="space-y-4 md:space-y-6">
+                    {nodes.map((node, idx) => {
+                        const isEven = idx % 2 === 0;
+                        const colors = getColorClasses(node.color, node.isActive, node.isCompleted);
+                        const hasSubItems = node.subItems && node.subItems.length > 0;
+                        const isExpanded = expandedNode === idx;
+                        const isClickable = Boolean(node.url || hasSubItems || (node.type === 'PROJECT_PLANNING' && node.data?.id));
+                        
+                        const CardContent = (
+                            <div className={`p-3.5 rounded-xl border bg-white shadow-sm transition-all duration-300 ${node.isActive ? (isClickable ? 'hover:shadow-md hover:-translate-y-1 hover:border-blue-300 cursor-pointer' : 'hover:shadow-md hover:-translate-y-1') : 'opacity-60'} ${colors.border}`}>
+                                <div className={`flex items-center justify-between gap-3 ${isEven ? 'md:flex-row-reverse' : ''}`}>
+                                    <div className={`flex items-center gap-3 ${isEven ? 'md:flex-row-reverse' : ''}`}>
+                                        <div className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${colors.bg} ${colors.text}`}>
+                                            {node.icon && React.cloneElement(node.icon as React.ReactElement<{ className: string }>, { className: 'w-4 h-4' })}
+                                        </div>
+                                        <div className={`flex flex-col ${isEven ? 'md:items-end' : 'items-start'}`}>
+                                            <h4 className={`font-bold text-sm ${node.isActive ? 'text-slate-800' : 'text-slate-500'}`}>{node.title}</h4>
+                                            <p className={`font-semibold text-xs mt-0.5 ${node.isActive ? colors.text : 'text-slate-400'}`}>
+                                                {node.desc}
+                                            </p>
+                                            {node.dateList && node.dateList.length > 0 && (
+                                                <div className={`flex flex-col gap-0.5 mt-2 ${isEven ? 'md:items-end' : 'items-start'}`}>
+                                                    {node.dateList.map((d: any, idxD: number) => d.val && (
+                                                        <span key={idxD} className="text-[10px] font-medium text-slate-500">
+                                                            <span className="text-slate-400">{d.label}:</span> {formatDateLabel(d.val)}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            )}
+                                        </div>
+                                    </div>
+                                    {(node.url || (node.type === 'PROJECT_PLANNING' && node.data?.id)) && !hasSubItems && (
+                                        <ExternalLink className={`w-4 h-4 text-slate-300 group-hover:text-blue-500 transition-colors shrink-0 ${isEven ? 'md:rotate-180' : ''}`} />
+                                    )}
+                                    {hasSubItems && (
+                                        <ChevronDown className={`w-4 h-4 text-slate-300 group-hover:text-blue-500 transition-transform shrink-0 ${isExpanded ? 'rotate-180' : ''}`} />
+                                    )}
+                                </div>
+                                
+                                {hasSubItems && isExpanded && (
+                                    <div className="mt-4 pt-3 border-t border-slate-100 flex flex-col gap-2">
+                                        {node.subItems.map((sub: any, sIdx: number) => {
+                                            const canOpenDocument = Boolean(sub.url || sub.hasGeneratedFallback || sub.type === 'PROJECT_PLANNING_PHOTOS' || sub.type === 'PROJECT_PLANNING');
+                                            const SubContent = (
+                                               <div className={`flex items-center justify-between p-2.5 rounded-lg border border-slate-100 ${canOpenDocument ? 'hover:border-blue-200 hover:bg-blue-50/50 cursor-pointer' : 'bg-slate-50 opacity-80'} transition-colors ${isEven ? 'md:flex-row-reverse text-right' : 'text-left'}`}>
+                                                   <div className="flex flex-col">
+                                                       <span className="text-sm font-bold text-slate-700">{sub.title}</span>
+                                                       <span className="text-xs text-slate-500">{sub.desc}</span>
+                                                   </div>
+                                                   {canOpenDocument && <ExternalLink className="w-3.5 h-3.5 text-slate-400 shrink-0" />}
+                                               </div>
+                                            );
+                                            return canOpenDocument ? (
+                                                <button
+                                                    key={sIdx}
+                                                    type="button"
+                                                    className="w-full text-left"
+                                                    onClick={async (e) => {
+                                                        e.stopPropagation();
+                                                        if (sub.type === 'PROJECT_PLANNING_PHOTOS') {
+                                                            await viewGeneratedPdfOnline(sub.id, 'PROJECT_PLANNING_PHOTOS');
+                                                        } else if (sub.type === 'PROJECT_PLANNING') {
+                                                            if (sub.url) {
+                                                                window.open(getProxyUrl(sub.url), '_blank', 'noopener,noreferrer');
+                                                            } else {
+                                                                await viewGeneratedPdfOnline(sub.id, 'PROJECT_PLANNING');
+                                                            }
+                                                        } else {
+                                                            await openPengawasanDocument(sub);
+                                                        }
+                                                    }}
+                                                >
+                                                    {SubContent}
+                                                </button>
+                                            ) : (
+                                                <div key={sIdx} onClick={(e) => e.stopPropagation()}>
+                                                    {SubContent}
+                                                </div>
+                                            );
+                                        })}
+                                    </div>
+                                )}
+                            </div>
+                        );
+
+                        return (
+                            <div key={idx} className={`relative flex items-center md:justify-between w-full group ${isEven ? 'md:flex-row-reverse' : ''}`}>
+                                
+                                <div className="hidden md:block w-[45%]"></div>
+
+                                <div className={`absolute left-8 md:left-1/2 w-5 h-5 rounded-full border-[3px] border-white ${colors.dot} -translate-x-1/2 flex items-center justify-center shadow-sm z-10 transition-transform group-hover:scale-125`}>
+                                </div>
+
+                                <div className={`w-full md:w-[45%] pl-14 md:pl-0 ${isEven ? 'md:pr-10 md:text-right' : 'md:pl-10'}`}>
+                                    {node.url && !hasSubItems ? (
+                                        <a href={getProxyUrl(node.url)} target="_blank" rel="noreferrer" className="block outline-none">
+                                            {CardContent}
+                                        </a>
+                                    ) : hasSubItems ? (
+                                        <div onClick={() => setExpandedNode(isExpanded ? null : idx)} className="block outline-none">
+                                            {CardContent}
+                                        </div>
+                                    ) : node.type === 'PROJECT_PLANNING' && node.data?.id ? (
+                                        <button
+                                            type="button"
+                                            className="w-full text-left outline-none block"
+                                            onClick={async (e) => {
+                                                e.stopPropagation();
+                                                try {
+                                                    await viewGeneratedPdfOnline(node.data.id, 'PROJECT_PLANNING');
+                                                } catch (err) {
+                                                    console.error('Failed to view project planning pdf', err);
+                                                }
+                                            }}
+                                        >
+                                            {CardContent}
+                                        </button>
+                                    ) : (
+                                        CardContent
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                </div>
+            </div>
+        </div>
+    );
+}

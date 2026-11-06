@@ -1,0 +1,775 @@
+"use client"
+
+import React, { useState, useEffect } from 'react';
+import { useRouter } from 'next/navigation';
+import { useSession } from '@/context/SessionContext';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Save, Loader2, Search, FileText, AlertCircle, CheckCircle, XCircle, AlertTriangle } from 'lucide-react';
+import AppNavbar from '@/components/AppNavbar';
+import { useGlobalAlert } from '@/context/GlobalAlertContext';
+import { fetchKontraktorList, fetchSPKList, submitSPK, fetchRABList, sendEmailNotification, fetchSpkBackdatePolicy } from '@/lib/api';
+import { BRANCH_GROUPS, canViewAllBranches, isViewOnlyUser, getParentBranch } from '@/lib/constants';
+import { parseCurrency } from '@/lib/utils';
+import { DatePicker } from '@/components/ui/date-picker';
+import { fetchActiveSpByKontraktor, type DendaAction } from '@/lib/denda-actions-api';
+
+const getCabangCode = (cabangName: string) => {
+    const map: Record<string, string> = {
+        "WHC IMAM BONJOL": "7AZ1", "LUWU": "2VZ1", "KARAWANG": "1JZ1", "REMBANG": "2AZ1",
+        "BANJARMASIN": "1GZ1", "PARUNG": "1MZ1", "TEGAL": "2PZ1", "GORONTALO": "2SZ1",
+        "PONTIANAK": "1PZ1", "LOMBOK": "1SZ1", "SUMBAWA": "1SZ1", "KOTABUMI": "LZ01", "SERANG": "2GZ1",
+        "CIANJUR": "2JZ1", "BALARAJA": "TZ01", "SIDOARJO": "UZ01", "SIDOARJO BPN SMD": "UZ01", "SIDOARJO BPN_SMD": "UZ01",
+        "MANOKWARI": "UZ01", "NTT": "UZ01", "SORONG": "UZ01", "MEDAN": "WZ01", "ACEH": "WZ01",
+        "BOGOR": "XZ01", "JEMBER": "YZ01", "BALI": "QZ01", "PALEMBANG": "PZ01",
+        "BENGKULU": "PZ01", "BANGKA": "PZ01", "BELITUNG": "PZ01",
+        "KLATEN": "OZ01", "MAKASSAR": "RZ01", "PLUMBON": "VZ01", "PEKANBARU": "1AZ1",
+        "JAMBI": "1DZ1", "HEAD OFFICE": "Z001", "BANDUNG 1": "BZ01", "BANDUNG 2": "NZ01",
+        "BEKASI": "CZ01", "CILACAP": "IZ01", "CILEUNGSI": "JZ01", "SEMARANG": "HZ01",
+        "CIKOKOL": "KZ01", "LAMPUNG": "LZ01", "MALANG": "MZ01", "MANADO": "1YZ1",
+        "BATAM": "2DZ1", "BINTAN": "KZ01", "MADIUN": "2MZ1",
+    };
+    return map[cabangName.toUpperCase()] || cabangName.substring(0, 3).toUpperCase();
+};
+
+const formatRupiah = (number: number) => new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", minimumFractionDigits: 0 }).format(number);
+
+const normalizeText = (value?: string | null) => String(value ?? "").trim().toUpperCase();
+
+const getSpkGrandTotal = (rab: any) => {
+    if (!rab) return 0;
+    return parseCurrency(rab["Grand Total Final"] ?? rab["Grand Total"]) || 0;
+};
+
+const getTodayDateString = () => {
+    const today = new Date();
+    const year = today.getFullYear();
+    const month = String(today.getMonth() + 1).padStart(2, '0');
+    const day = String(today.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+};
+
+// Tipe untuk data form yang dimuat saat revisi
+type RevisiFormSnapshot = {
+    kode_toko: string;
+    nama_kontraktor: string;
+    waktu_mulai: string;
+    durasi: string;
+    spk_bulan: string;
+    spk_tahun: string;
+    par_no: string;
+    par_bulan: string;
+    par_tahun: string;
+};
+
+export default function SPKPage() {
+    const router = useRouter();
+    const { showAlert } = useGlobalAlert();
+
+    const [userInfo, setUserInfo] = useState({ name: '', role: '', cabang: '', email: '' });
+    const [isLoading, setIsLoading] = useState(false);
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    
+    // Modal Sukses
+    const [showSuccessModal, setShowSuccessModal] = useState(false);
+
+    // Modal Notifikasi SPK Ditolak
+    const [rejectedModal, setRejectedModal] = useState<{
+        isOpen: boolean;
+        alasanPenolakan: string;
+        namaKontraktor: string;
+    }>({ isOpen: false, alasanPenolakan: '', namaKontraktor: '' });
+
+    // Data API
+    const [approvedRabs, setApprovedRabs] = useState<any[]>([]);
+    const [kontraktorList, setKontraktorList] = useState<string[]>([]);
+    const [backdateBranches, setBackdateBranches] = useState<string[]>([]);
+    const [searchUlok, setSearchUlok] = useState('');
+    const [cabangFilter, setCabangFilter] = useState('');
+    const [autoSelectedTargetKey, setAutoSelectedTargetKey] = useState<string | null>(null);
+    
+    // Status Info
+    const [spkMsg, setSpkMsg] = useState({ text: '', type: '' });
+    const [isLocked, setIsLocked] = useState(false);
+
+    // State Form & Revisi
+    const [selectedRabObj, setSelectedRabObj] = useState<any>(null);
+    const [revisiData, setRevisiData] = useState({ isRevisi: false, sequence: '', rowIndex: null });
+    const [revisiMinStartDate, setRevisiMinStartDate] = useState('');
+    const [activeSpWarnings, setActiveSpWarnings] = useState<DendaAction[]>([]);
+
+    const [form, setForm] = useState({
+        nomor_ulok: '',
+        kode_cabang: '',
+        nama_kontraktor: '',
+        waktu_mulai: '',
+        durasi: '',
+        nama_toko: '',
+        kode_toko: '',
+        spk_bulan: '', spk_tahun: new Date().getFullYear().toString().slice(-2),
+        par_no: '', par_bulan: '', par_tahun: new Date().getFullYear().toString()
+    });
+
+    const { user } = useSession();
+    const isSuperHuman = user?.isSuperHuman ?? false;
+    const isReadOnly = isViewOnlyUser(user?.roles, isSuperHuman);
+    const activeBackdateBranch = getParentBranch(selectedRabObj?.Cabang || userInfo.cabang);
+    const canBackdateStartDate = Boolean(activeBackdateBranch && backdateBranches.includes(activeBackdateBranch));
+
+    useEffect(() => {
+        if (!user) return;
+
+        const { role, email, cabang } = user;
+        const isHOUser = cabang.toUpperCase() === 'HEAD OFFICE';
+        const isSHUser = user.isSuperHuman ?? false;
+        const isRegionalUser = user.isRegionalManager ?? false;
+
+        const picRoles = ['BRANCH BUILDING & MAINTENANCE MANAGER', 'BRANCH BUILDING COORDINATOR', 'BRANCH BUILDING SUPPORT'];
+        if (!isHOUser && !isSHUser && !isRegionalUser && !picRoles.includes(role.toUpperCase())) {
+            showAlert({ message: "Hanya PIC yang dapat membuat SPK.", type: "warning", onConfirm: () => router.push('/dashboard') });
+            return;
+        }
+
+        const name = email.split('@')[0].toUpperCase();
+        setUserInfo({ name, role, cabang, email });
+        setForm(prev => ({ ...prev, kode_cabang: getCabangCode(cabang) }));
+
+        loadBackdatePolicy();
+        loadApprovedRabs(cabang, canViewAllBranches(user.roles, isSHUser));
+    }, [user, router]);
+
+    useEffect(() => {
+        if (form.nama_kontraktor) {
+            fetchActiveSpByKontraktor(form.nama_kontraktor)
+                .then(res => {
+                    if (res.data && Array.isArray((res.data as any).actions || res.data)) {
+                        const sourceArray = Array.isArray(res.data) ? res.data : (res.data as any).actions;
+                        const active = sourceArray.filter((sp: any) => 
+                            sp.is_active && 
+                            ['APPROVED', 'SENT_TO_CONTRACTOR', 'VIEWED_BY_CONTRACTOR', 'ACKNOWLEDGED_BY_CONTRACTOR'].includes(sp.status)
+                        );
+                        setActiveSpWarnings(active);
+                    } else {
+                        setActiveSpWarnings([]);
+                    }
+                })
+                .catch(err => {
+                    console.error("Gagal mengecek status SP kontraktor:", err);
+                    setActiveSpWarnings([]);
+                });
+        } else {
+            setActiveSpWarnings([]);
+        }
+    }, [form.nama_kontraktor]);
+
+    const loadBackdatePolicy = async () => {
+        try {
+            const result = await fetchSpkBackdatePolicy({ suppressGlobalError: true });
+            setBackdateBranches((result.data.enabled_branches ?? []).map(getParentBranch));
+        } catch (error) {
+            console.warn("Gagal memuat policy backdate SPK:", error);
+            setBackdateBranches([]);
+        }
+    };
+
+    const loadApprovedRabs = async (cabang: string, canSeeAllBranches = false) => {
+        setIsLoading(true);
+        try {
+            const res = await fetchRABList({ status: "Disetujui" });
+            const listRab = res.data || [];
+            
+            const upperCabang = cabang.toUpperCase();
+            let userGroup: string[] | null = null;
+            for (const grp of Object.values(BRANCH_GROUPS)) {
+                if (grp.includes(upperCabang)) {
+                    userGroup = grp;
+                    break;
+                }
+            }
+            
+            const filteredRabs = canSeeAllBranches ? listRab : listRab.filter((r: any) => {
+                if (userGroup) {
+                    return userGroup.includes(r.cabang?.toUpperCase());
+                }
+                return r.cabang?.toUpperCase() === upperCabang;
+            });
+            
+            const mappedData = filteredRabs.map((r: any) => ({
+                "id_toko": r.id_toko || r.toko?.id,
+                "Nomor Ulok": r.nomor_ulok,
+                "Lingkup_Pekerjaan": r.lingkup_pekerjaan || "-",
+                "Cabang": r.cabang,
+                "Nama_Toko": r.toko?.nama_toko || r.nama_toko,
+                "Kode_Toko": r.toko?.kode_toko || "", 
+                "nama_pt": r.nama_pt || "",
+                "Proyek": r.proyek || "-",
+                "Alamat": r.toko?.alamat || "-",
+                "Grand Total": r.grand_total || 0,
+                "Grand Total Non PPN": r.grand_total_non_sbo || r.grand_total || 0,
+                "Grand Total Final": r.grand_total_final || r.grand_total || 0,
+                "Durasi_Pekerjaan": r.durasi_pekerjaan || "",
+            }));
+            
+            setApprovedRabs(mappedData);
+        } catch (error: any) {
+            showAlert({ message: "Gagal memuat data RAB: " + error.message, type: "error" });
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    useEffect(() => {
+        if (approvedRabs.length === 0 || typeof window === 'undefined') return;
+
+        const params = new URLSearchParams(window.location.search);
+        const nomorUlok = params.get('nomor_ulok');
+        const lingkup = params.get('lingkup');
+        const idToko = params.get('id_toko');
+        if (!nomorUlok && !idToko) return;
+
+        const targetKey = [nomorUlok, lingkup, idToko].filter(Boolean).join('|');
+        if (autoSelectedTargetKey === targetKey) return;
+
+        const target = approvedRabs.find(r => {
+            const sameUlok = nomorUlok ? r["Nomor Ulok"] === nomorUlok : true;
+            const sameLingkup = lingkup ? r["Lingkup_Pekerjaan"] === lingkup : true;
+            const sameToko = idToko ? String(r.id_toko) === idToko : true;
+            return sameUlok && sameLingkup && sameToko;
+        });
+
+        if (!target) return;
+
+        setAutoSelectedTargetKey(targetKey);
+        setSearchUlok(target["Nama_Toko"] || target["Nomor Ulok"] || '');
+        setCabangFilter(target.Cabang || '');
+        handleUlokSelect(`${target["Nomor Ulok"]} (${target["Lingkup_Pekerjaan"]})`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [approvedRabs, autoSelectedTargetKey]);
+
+    const handleUlokSelect = async (ulokStr: string) => {
+        setSpkMsg({ text: '', type: '' });
+        setIsLocked(false);
+        setRevisiData({ isRevisi: false, sequence: '', rowIndex: null });
+
+        if (!ulokStr) {
+            setSelectedRabObj(null); 
+            setForm(prev => ({ 
+                ...prev, nomor_ulok: '', nama_kontraktor: '', waktu_mulai: '', durasi: '', 
+                spk_bulan: '', par_no: '', par_bulan: '', nama_toko: '', kode_toko: '' 
+            })); 
+            return;
+        }
+
+        const selectedUlok = ulokStr.split(" (")[0];
+        const selectedLingkup = ulokStr.includes("(") ? ulokStr.split("(")[1].replace(")", "") : null;
+        
+        const selected = approvedRabs.find(r => r["Nomor Ulok"] === selectedUlok && r["Lingkup_Pekerjaan"] === selectedLingkup);
+        
+        if (selected) {
+            setSelectedRabObj(selected);
+            setRevisiMinStartDate('');
+            setRevisiData({ isRevisi: false, sequence: '', rowIndex: null });
+            let initialKodeToko = selected["Kode_Toko"] || selected["kode_toko"] || '';
+            let initialNamaKontraktor = selected["nama_pt"] || '';
+
+            setForm(prev => ({ 
+                ...prev, 
+                nomor_ulok: ulokStr, 
+                kode_cabang: getCabangCode(selected.Cabang),
+                nama_toko: selected["Nama_Toko"] || selected["nama_toko"] || '',
+                kode_toko: initialKodeToko,
+                nama_kontraktor: initialNamaKontraktor,
+                durasi: selected["Durasi_Pekerjaan"] || ''
+            }));
+            
+            setSpkMsg({ text: "Memuat Kontraktor dan Status SPK...", type: "info" });
+            
+            // Fetch Kontraktor
+            try {
+                const names = await fetchKontraktorList(selected.Cabang);
+                setKontraktorList(names || []);
+                if (!names?.length) {
+                    setSpkMsg({ text: `Tidak ada kontraktor aktif untuk cabang ${selected.Cabang}.`, type: "warning" });
+                }
+            } catch (error: any) {
+                setKontraktorList([]); 
+                setSpkMsg({ text: `Gagal memuat kontraktor: ${error?.message || "Terjadi kesalahan."}`, type: "warning" });
+            }
+
+            // Check Status SPK
+            if (selectedUlok && selectedLingkup) {
+                try {
+                    const spkRes = await fetchSPKList({ nomor_ulok: selectedUlok });
+                    
+                    if (!initialKodeToko && spkRes.data && spkRes.data.length > 0) {
+                        const spkWithKodeToko = spkRes.data.find((s: any) => s.toko?.kode_toko);
+                        if (spkWithKodeToko && spkWithKodeToko.toko?.kode_toko) {
+                            setForm(prev => ({ ...prev, kode_toko: spkWithKodeToko.toko?.kode_toko || '' }));
+                        }
+                    }
+
+                    const existingSpks = spkRes.data.filter((s: any) => s.lingkup_pekerjaan === selectedLingkup);
+                    
+                    if (existingSpks.length > 0) {
+                        const latestSpk = existingSpks.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())[0];
+                        const status = latestSpk.status;
+                        
+                        if (status === "SPK_REJECTED") {
+                            // Parse nomor PAR (Format Baru: 0091/PROPNDEV-1AZ1/IV/2026)
+                            let pNo = '', pB = '', pT = '';
+                            if (latestSpk.par) {
+                                const parParts = latestSpk.par.split("/");
+                                if (parParts.length >= 4) {
+                                    pNo = parParts[0];
+                                    pB = parParts[2];
+                                    pT = parParts[3];
+                                }
+                            }
+
+                            const rejectedStartDate = latestSpk.waktu_mulai ? latestSpk.waktu_mulai.split("T")[0] : '';
+                            const autofilledForm: RevisiFormSnapshot = {
+                                kode_toko: latestSpk.toko?.kode_toko || selected["Kode_Toko"] || selected["kode_toko"] || '',
+                                nama_kontraktor: latestSpk.nama_kontraktor || '',
+                                waktu_mulai: rejectedStartDate,
+                                durasi: selected["Durasi_Pekerjaan"]?.toString() || latestSpk.durasi?.toString() || '',
+                                spk_bulan: latestSpk.spk_manual_1 || '',
+                                spk_tahun: latestSpk.spk_manual_2 || new Date().getFullYear().toString().slice(-2),
+                                par_no: pNo,
+                                par_bulan: pB,
+                                par_tahun: pT || new Date().getFullYear().toString(),
+                            };
+
+                            // Autofill form
+                            setRevisiData({ isRevisi: true, sequence: latestSpk.nomor_spk?.split('/')[0] || '', rowIndex: null });
+                            setRevisiMinStartDate(rejectedStartDate);
+                            setForm(prev => ({ ...prev, ...autofilledForm }));
+
+                            // Tampilkan pesan inline minimal
+                            setSpkMsg({ text: "Data SPK yang ditolak telah dimuat. Periksa kembali datanya lalu kirim revisi SPK.", type: "warning" });
+
+                            // Tampilkan popup modal notifikasi penolakan
+                            setRejectedModal({
+                                isOpen: true,
+                                alasanPenolakan: latestSpk.alasan_penolakan || 'Tidak ada alasan yang diberikan.',
+                                namaKontraktor: latestSpk.nama_kontraktor || '-',
+                            });
+
+                        } else if (status === "WAITING_FOR_BM_APPROVAL") {
+                            setSpkMsg({ text: "SPK sedang dalam proses persetujuan (Menunggu Branch Manager). Tidak bisa disubmit ulang.", type: "warning" });
+                            setIsLocked(true);
+                        } else if (status === "SPK_APPROVED") {
+                            setSpkMsg({ text: "SPK sudah disetujui!", type: "success" });
+                            setIsLocked(true);
+                        }
+                    } else {
+                        setSpkMsg({ text: "Silakan lengkapi form untuk pengajuan SPK baru.", type: "info" });
+                    }
+                } catch {
+                    setSpkMsg({ text: "Gagal mengecek status SPK.", type: "error" });
+                }
+            }
+        }
+    };
+
+    const handleSubmit = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (isReadOnly) {
+            showAlert({ message: "Role ini hanya memiliki akses view.", type: "warning" });
+            return;
+        }
+        if (!selectedRabObj) return;
+
+        // Validasi kode toko sebelum submit
+        if (!form.kode_toko || form.kode_toko.trim().length !== 4) {
+            showAlert({ message: "Kode Toko harus tepat 4 karakter alfanumerik.", type: "error" });
+            return;
+        }
+        if (!/^[A-Z0-9]{4}$/.test(form.kode_toko.trim())) {
+            showAlert({ message: "Kode Toko harus 4 karakter alfanumerik (contoh: T123, AB12, 1A2B).", type: "error" });
+            return;
+        }
+
+        const fullPAR = `${form.par_no}/PROPNDEV-${form.kode_cabang}/${form.par_bulan}/${form.par_tahun}`;
+
+        const payload = {
+            id_toko: parseInt(selectedRabObj["id_toko"], 10),
+            nomor_ulok: selectedRabObj["Nomor Ulok"],
+            email_pembuat: userInfo.email,
+            lingkup_pekerjaan: selectedRabObj["Lingkup_Pekerjaan"],
+            nama_kontraktor: form.nama_kontraktor,
+            proyek: selectedRabObj["Proyek"] || "N/A",
+            kode_toko: form.kode_toko,
+            waktu_mulai: form.waktu_mulai,
+            durasi: parseInt(form.durasi),
+            grand_total: getSpkGrandTotal(selectedRabObj),
+            par: fullPAR,
+            spk_manual_1: form.spk_bulan,
+            spk_manual_2: form.spk_tahun
+        };
+
+        setIsSubmitting(true);
+        try {
+            await submitSPK(payload);
+            
+            // Kirim notifikasi email ke Branch Manager
+            try {
+                await sendEmailNotification({
+                    cabang: selectedRabObj["Cabang"],
+                    id_toko: selectedRabObj["id_toko"],
+                    flag: "send-notification-spk"
+                });
+            } catch (emailErr) {
+                console.error("Gagal mengirim email notifikasi:", emailErr);
+            }
+
+            setShowSuccessModal(true);
+        } catch (err: any) {
+            showAlert({ message: err.message || "Gagal menyimpan SPK.", type: "error" });
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    const isHOUserFilter = canViewAllBranches(user?.roles, user?.isSuperHuman ?? false) || userInfo.cabang?.toUpperCase() === 'HEAD OFFICE';
+
+    const filteredRabs = approvedRabs.filter(r => {
+        const matchSearch = (r["Nomor Ulok"] || "").toLowerCase().includes(searchUlok.toLowerCase()) || 
+                            (r["Nama_Toko"] || "").toLowerCase().includes(searchUlok.toLowerCase());
+        let matchCabang = true;
+        if (cabangFilter) {
+            const rabCabang = r.Cabang?.toUpperCase() || '';
+            const effectiveBranch = isHOUserFilter ? getParentBranch(rabCabang) : rabCabang;
+            matchCabang = effectiveBranch === cabangFilter.toUpperCase();
+        }
+        return matchSearch && matchCabang;
+    });
+
+    // Options untuk cabang filter jika user termasuk dalam BRANCH_GROUP atau HO
+    const cabangOptions = React.useMemo(() => {
+        const upper = userInfo.cabang?.toUpperCase();
+        if (!upper) return [];
+        if (isHOUserFilter) {
+            const allBranches = Array.from(new Set(Object.values(BRANCH_GROUPS).flat())).sort();
+            return Array.from(new Set(allBranches.map(b => getParentBranch(b)))).sort();
+        }
+        let userGroup: string[] | null = null;
+        for (const grp of Object.values(BRANCH_GROUPS)) {
+            if (grp.includes(upper)) {
+                userGroup = grp;
+                break;
+            }
+        }
+        return userGroup ? [...userGroup].sort() : [];
+    }, [userInfo.cabang, isHOUserFilter]);
+
+    return (
+        <div className="min-h-screen bg-slate-50 font-sans pb-12 relative">
+            <AppNavbar
+                title="SURAT PERINTAH KERJA"
+                showBackButton
+                backHref="/dashboard"
+            />
+
+            <main className="max-w-5xl mx-auto p-4 md:p-8 mt-4">
+                <Card className="shadow-sm border-slate-200 relative z-10">
+                    <div className="p-6 border-b border-slate-100 bg-white rounded-t-xl flex items-center gap-3">
+                        <div className="p-2 bg-red-50 text-red-600 rounded-lg"><FileText className="w-6 h-6"/></div>
+                        <div>
+                            <h2 className="text-xl font-bold text-slate-800">Surat Perintah Kerja (SPK)</h2>
+                            <p className="text-sm text-slate-500">Pilih Nomor Ulok dari RAB yang telah disetujui.</p>
+                        </div>
+                    </div>
+
+                    <CardContent className="p-6 md:p-8 bg-slate-50/50">
+                        <form onSubmit={handleSubmit} className="space-y-8">
+                            
+                            {/* SECTION 1: PEMILIHAN ULOK & IDENTITAS TOKO */}
+                            <div className="space-y-4 bg-white p-5 rounded-xl border border-slate-200 shadow-sm">
+                                <h3 className="font-bold text-slate-700 border-b pb-2 mb-4">1. Data Referensi RAB &amp; Identitas Toko</h3>
+                                
+                                <div className="space-y-2">
+                                    <label className="text-sm font-medium text-slate-700">Cari &amp; Pilih Nomor Ulok *</label>
+                                    <div className="relative mb-2">
+                                        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                                        <input type="text" placeholder="Ketik No Ulok / Nama Toko..." className="w-full pl-9 pr-4 py-2 border rounded-lg focus:ring-2 focus:ring-red-500 outline-none text-sm" value={searchUlok} onChange={(e) => setSearchUlok(e.target.value)} />
+                                    </div>
+                                    {isLoading ? (
+                                        <div className="p-3 text-center text-slate-500 bg-slate-100 rounded-lg text-sm"><Loader2 className="w-4 h-4 animate-spin inline mr-2"/> Memuat data RAB...</div>
+                                    ) : (
+                                        <div className="flex flex-col md:flex-row gap-3">
+                                            {cabangOptions.length > 0 && (
+                                                <select
+                                                    className="w-full md:w-1/3 p-3 border rounded-lg bg-white outline-none text-sm text-slate-700 focus:ring-2 focus:ring-blue-500"
+                                                    value={cabangFilter}
+                                                    onChange={(e) => {
+                                                        setCabangFilter(e.target.value);
+                                                        setForm(prev => ({ ...prev, nomor_ulok: '' })); // reset pilihan ulok jika cabang berubah
+                                                        setSelectedRabObj(null);
+                                                    }}
+                                                >
+                                                    <option value="">Semua Cabang (Grup)</option>
+                                                    {cabangOptions.map(c => <option key={c} value={c}>{c}</option>)}
+                                                </select>
+                                            )}
+                                            <select required className="w-full flex-1 p-3 border rounded-lg bg-slate-50 outline-none font-semibold text-slate-700 cursor-pointer focus:bg-white focus:ring-2 focus:ring-red-500" value={form.nomor_ulok} onChange={(e) => handleUlokSelect(e.target.value)}>
+                                                <option value="">-- Klik untuk Pilih Ulok --</option>
+                                                {filteredRabs.map((r, i) => <option key={i} value={`${r["Nomor Ulok"]} (${r["Lingkup_Pekerjaan"]})`}>{r["Nomor Ulok"]} ({r["Lingkup_Pekerjaan"]}) - {r["Proyek"]} - {r["Nama_Toko"]}</option>)}
+                                            </select>
+                                        </div>
+                                    )}
+                                </div>
+
+                                {/* Pesan Status SPK */}
+                                {spkMsg.text && (
+                                    <div className={`p-4 rounded-lg flex items-start gap-3 mt-4 font-medium text-sm ${
+                                        spkMsg.type === 'error'   ? 'bg-red-50 text-red-700 border border-red-200' :
+                                        spkMsg.type === 'success' ? 'bg-green-50 text-green-700 border border-green-200' :
+                                        spkMsg.type === 'warning' ? 'bg-amber-50 text-amber-700 border border-amber-200' :
+                                        'bg-blue-50 text-blue-700 border border-blue-200'
+                                    }`}>
+                                        <AlertCircle className="w-5 h-5 shrink-0" /> <p>{spkMsg.text}</p>
+                                    </div>
+                                )}
+
+                                {/* Banner informasi saat revisi */}
+                                {revisiData.isRevisi && (
+                                    <div className="p-3 rounded-lg flex items-center gap-2 text-xs font-semibold border bg-blue-50 text-blue-700 border-blue-200">
+                                        <AlertCircle className="w-4 h-4 shrink-0"/>
+                                        Data SPK yang ditolak sudah dimuat. Revisi bisa dikirim ulang setelah data diperiksa.
+                                    </div>
+                                )}
+
+                                {selectedRabObj && (
+                                    <div className="pt-4 border-t mt-4 border-slate-100">
+                                        <div className="mb-4 space-y-2">
+                                            <label className="text-sm font-medium text-slate-700">
+                                                Kode Toko * 
+                                                <span className="text-slate-500 font-normal ml-2">(4 karakter alfanumerik)</span>
+                                            </label>
+                                            <div className="flex flex-col gap-2">
+                                                <input 
+                                                    type="text" 
+                                                    required 
+                                                    readOnly={isReadOnly}
+                                                    maxLength={4}
+                                                    minLength={4}
+                                                    pattern="[A-Za-z0-9]{4}"
+                                                    className="w-full md:w-48 p-3 text-center text-lg font-mono font-bold tracking-wider border-2 border-slate-300 rounded-lg bg-white outline-none focus:ring-2 focus:ring-blue-500 focus:border-blue-500 uppercase transition-all" 
+                                                    value={form.kode_toko} 
+                                                    onChange={e => {
+                                                        const cleaned = e.target.value.replace(/[^a-zA-Z0-9]/g, '').toUpperCase().slice(0, 4);
+                                                        setForm({...form, kode_toko: cleaned});
+                                                    }} 
+                                                    placeholder="T123" 
+                                                />
+                                                <div className="flex items-center gap-2 text-xs">
+                                                    {form.kode_toko.length > 0 && (
+                                                        <div className="flex items-center gap-1">
+                                                            <div className={`w-2 h-2 rounded-full ${form.kode_toko.length === 4 ? 'bg-green-500' : 'bg-amber-500'}`}></div>
+                                                            <span className={form.kode_toko.length === 4 ? 'text-green-600 font-medium' : 'text-amber-600'}>
+                                                                {form.kode_toko.length}/4 karakter
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    {!form.kode_toko && (
+                                                        <span className="text-slate-500">Contoh: T123, AB12, 1A2B</span>
+                                                    )}
+                                                </div>
+                                            </div>
+                                        </div>
+                                        
+                                        <div className="grid grid-cols-1 md:grid-cols-4 gap-4 bg-slate-50 p-4 rounded-lg">
+                                            <div><p className="text-xs font-medium text-slate-500 uppercase">Nama Toko</p><p className="font-semibold text-slate-800">{form.nama_toko || '-'}</p></div>
+                                            <div><p className="text-xs font-medium text-slate-500 uppercase">Proyek</p><p className="font-semibold text-slate-800">{selectedRabObj.Proyek}</p></div>
+                                            <div><p className="text-xs font-medium text-slate-500 uppercase">Lingkup</p><p className="font-semibold text-slate-800">{selectedRabObj.Lingkup_Pekerjaan}</p></div>
+                                            <div>
+                                                <p className="text-xs font-medium text-slate-500 uppercase">Grand Total Final</p>
+                                                <p className="font-bold text-red-600">{formatRupiah(getSpkGrandTotal(selectedRabObj))}</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+
+                            {/* SECTION 2: PENOMORAN DOKUMEN & KONTRAKTOR */}
+                            <div className={`space-y-5 bg-white p-5 rounded-xl border border-slate-200 shadow-sm ${isLocked ? 'opacity-50 pointer-events-none' : ''}`}>
+                                <h3 className="font-bold text-slate-700 border-b pb-2">2. Data Kontraktor &amp; Dokumen</h3>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-slate-700">Nama Kontraktor *</label>
+                                        <input 
+                                            type="text" 
+                                            required 
+                                            readOnly 
+                                            className="w-full p-2.5 border border-slate-300 rounded-lg bg-slate-100 text-slate-600 font-bold outline-none cursor-not-allowed" 
+                                            value={form.nama_kontraktor} 
+                                            placeholder="Otomatis dari RAB"
+                                        />
+                                        {activeSpWarnings.length > 0 && (
+                                            <div className="mt-2 text-xs font-medium text-red-700 bg-red-50 border border-red-200 px-3 py-2 rounded-lg flex items-start gap-2 animate-in fade-in">
+                                                <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-red-600 animate-pulse" />
+                                                <span>Kontraktor ini berstatus <strong>SP{Math.max(...activeSpWarnings.map(sp => sp.sp_level || 0))}</strong> aktif. Harap pertimbangkan dengan seksama sebelum menyetujui SPK.</span>
+                                            </div>
+                                        )}
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-slate-700">Kode Cabang Penomoran</label>
+                                        <input type="text" required readOnly className="w-full p-2.5 border bg-slate-100 rounded-lg text-slate-600 font-bold uppercase" value={form.kode_cabang} />
+                                    </div>
+                                </div>
+
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-slate-700">Nomor SPK *</label>
+                                        <div className="flex items-center gap-2 bg-slate-50 p-2 border border-slate-300 rounded-lg overflow-x-auto text-sm">
+                                            <span className="font-bold text-slate-500 whitespace-nowrap bg-slate-200 px-2 py-1.5 rounded">{revisiData.isRevisi ? revisiData.sequence : '(Otomatis)'}</span>
+                                            <span className="font-bold text-slate-400">/</span>
+                                            <span className="font-bold text-slate-600 whitespace-nowrap">PROPNDEV-{form.kode_cabang || '...'}</span>
+                                            <span className="font-bold text-slate-400">/</span>
+                                            <input type="text" required readOnly={isReadOnly} placeholder="Bulan (X)" className="w-16 p-1.5 text-center border rounded font-bold outline-none uppercase" value={form.spk_bulan} onChange={e => setForm({...form, spk_bulan: e.target.value.toUpperCase()})} />
+                                            <span className="font-bold text-slate-400">/</span>
+                                            <input type="text" required readOnly={isReadOnly} placeholder="Thn (25)" maxLength={2} className="w-14 p-1.5 text-center border rounded font-bold outline-none" value={form.spk_tahun} onChange={e => setForm({...form, spk_tahun: e.target.value})} />
+                                        </div>
+                                    </div>
+
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-slate-700">Nomor PAR *</label>
+                                        <div className="flex items-center gap-2 bg-slate-50 p-2 border border-slate-300 rounded-lg overflow-x-auto text-sm">
+                                            <input type="text" required readOnly={isReadOnly} placeholder="No" className="w-16 p-1.5 text-center border rounded font-bold outline-none uppercase" value={form.par_no} onChange={e => setForm({...form, par_no: e.target.value.toUpperCase()})} />
+                                            <span className="font-bold text-slate-400">/</span>
+                                            <span className="font-bold text-slate-600 whitespace-nowrap">PROPNDEV-{form.kode_cabang || '...'}</span>
+                                            <span className="font-bold text-slate-400">/</span>
+                                            <input type="text" required readOnly={isReadOnly} placeholder="Bulan (X)" className="w-16 p-1.5 text-center border rounded font-bold outline-none uppercase" value={form.par_bulan} onChange={e => setForm({...form, par_bulan: e.target.value.toUpperCase()})} />
+                                            <span className="font-bold text-slate-400">/</span>
+                                            <input type="text" required readOnly={isReadOnly} placeholder="Thn" maxLength={4} className="w-16 p-1.5 text-center border rounded font-bold outline-none" value={form.par_tahun} onChange={e => setForm({...form, par_tahun: e.target.value})} />
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* SECTION 3: JADWAL */}
+                            <div className={`space-y-4 bg-white p-5 rounded-xl border border-slate-200 shadow-sm ${isLocked ? 'opacity-50 pointer-events-none' : ''}`}>
+                                <h3 className="font-bold text-slate-700 border-b pb-2 mb-4">3. Jadwal Pelaksanaan</h3>
+                                <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-slate-700">Tgl Mulai Pelaksanaan *</label>
+                                        <DatePicker
+                                            value={form.waktu_mulai}
+                                            onChange={val => setForm({...form, waktu_mulai: val})}
+                                            disabled={isReadOnly}
+                                            min={canBackdateStartDate ? undefined : (revisiData.isRevisi && revisiMinStartDate ? revisiMinStartDate : getTodayDateString())}
+                                            className="font-semibold"
+                                        />
+                                        <p className="text-xs text-slate-500 mt-1">
+                                            {canBackdateStartDate 
+                                                ? `Cabang ${activeBackdateBranch} dapat memilih tanggal sebelum hari ini (backdate).`
+                                                : revisiData.isRevisi && revisiMinStartDate
+                                                    ? `Revisi SPK ditolak dapat memilih tanggal mulai minimal ${revisiMinStartDate.split('-').reverse().join('/')}.`
+                                                : "Tanggal sebelum hari ini tidak bisa dipilih."}
+                                        </p>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label className="text-sm font-medium text-slate-700">Durasi (Hari) *</label>
+                                        <input
+                                            type="text"
+                                            required
+                                            readOnly
+                                            className="w-full p-2.5 border border-slate-300 rounded-lg bg-slate-100 text-slate-600 font-bold outline-none cursor-not-allowed"
+                                            value={form.durasi}
+                                            placeholder="Otomatis dari RAB"
+                                        />
+                                        <p className="text-xs text-slate-500 mt-1">Otomatis diambil dari data RAB yang dipilih.</p>
+                                    </div>
+                                </div>
+                            </div>
+
+                            {/* TOMBOL SUBMIT */}
+                            {!isReadOnly && (
+                                <div className="pt-4 pb-4">
+                                    <Button
+                                        type="submit"
+                                        disabled={isSubmitting || !form.nomor_ulok || isLocked}
+                                        className="w-full h-14 text-lg font-bold shadow-lg transition-all bg-red-600 hover:bg-red-700"
+                                    >
+                                        {isSubmitting
+                                            ? <><Loader2 className="w-6 h-6 mr-2 animate-spin"/> Menyimpan Data...</>
+                                            : <><Save className="w-6 h-6 mr-2"/> {revisiData.isRevisi ? 'Kirim Revisi SPK' : 'Kirim SPK Baru'}</>
+                                        }
+                                    </Button>
+                                </div>
+                            )}
+                        </form>
+                    </CardContent>
+                </Card>
+            </main>
+
+            {/* ========================================================
+                MODAL: NOTIFIKASI SPK DITOLAK
+            ======================================================== */}
+            {rejectedModal.isOpen && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200">
+                    <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-md w-full text-center animate-in zoom-in-95 duration-300">
+                        {/* Icon */}
+                        <div className="w-20 h-20 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-5">
+                            <XCircle className="w-12 h-12 text-red-600" />
+                        </div>
+
+                        {/* Judul */}
+                        <h2 className="text-2xl font-bold text-slate-800 mb-1">SPK Ditolak</h2>
+                        <p className="text-sm text-slate-500 mb-5">
+                            Pengajuan SPK untuk ULOK ini sebelumnya ditolak oleh Branch Manager.
+                        </p>
+
+                        {/* Alasan Penolakan */}
+                        <div className="bg-red-50 border border-red-200 rounded-xl p-4 mb-6 text-left">
+                            <p className="text-xs font-bold text-red-500 uppercase tracking-wider mb-1">Alasan Penolakan</p>
+                            <p className="text-sm font-semibold text-red-800 leading-relaxed">
+                                &ldquo;{rejectedModal.alasanPenolakan}&rdquo;
+                            </p>
+                        </div>
+
+                        {/* Info */}
+                        <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-6 flex items-start gap-2 text-left">
+                            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                            <p className="text-xs text-amber-700 font-medium leading-relaxed">
+                                Data SPK lama telah dimuat secara otomatis. Periksa kembali data sebelum mengirim revisi.
+                            </p>
+                        </div>
+
+                        {/* Tombol */}
+                        <Button
+                            onClick={() => setRejectedModal(prev => ({ ...prev, isOpen: false }))}
+                            className="w-full h-12 bg-red-600 hover:bg-red-700 text-white font-bold text-base rounded-xl"
+                        >
+                            Tutup &amp; Mulai Revisi
+                        </Button>
+                    </div>
+                </div>
+            )}
+
+            {/* ========================================================
+                MODAL: SUKSES SUBMIT SPK
+            ======================================================== */}
+            {showSuccessModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm animate-in fade-in duration-300">
+                    <div className="bg-white rounded-2xl shadow-2xl p-8 max-w-sm w-full text-center transform scale-100 animate-in zoom-in-95 duration-300">
+                        <div className="w-20 h-20 bg-green-100 rounded-full flex items-center justify-center mx-auto mb-5">
+                            <CheckCircle className="w-12 h-12 text-green-600" />
+                        </div>
+                        <h2 className="text-2xl font-bold text-slate-800 mb-2">Berhasil!</h2>
+                        <p className="text-slate-600 mb-8 leading-relaxed">
+                            Surat Perintah Kerja (SPK) untuk toko <b>{form.nama_toko}</b> berhasil disimpan dan dikirim untuk proses approval.
+                        </p>
+                        <Button 
+                            onClick={() => router.push('/dashboard')} 
+                            className="w-full h-12 bg-slate-800 hover:bg-slate-900 text-white font-bold text-lg rounded-xl"
+                        >
+                            Kembali ke Dashboard
+                        </Button>
+                    </div>
+                </div>
+            )}
+        </div>
+    );
+}

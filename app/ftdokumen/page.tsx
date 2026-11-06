@@ -1,0 +1,691 @@
+"use client";
+
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { useSession } from '@/context/SessionContext';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
+import { Input } from '@/components/ui/input';
+import { Label } from '@/components/ui/label';
+import { Button } from '@/components/ui/button';
+import { Checkbox } from '@/components/ui/checkbox';
+import {
+    ArrowRight, ArrowLeft, FileText, CheckCircle,
+    Loader2, Image as ImageIcon, ChevronDown, Search, Store, PencilLine
+} from 'lucide-react';
+import { DatePicker } from '@/components/ui/date-picker';
+import AppNavbar from '@/components/AppNavbar';
+import { useGlobalAlert } from '@/context/GlobalAlertContext';
+import { PHOTO_POINTS, ALL_POINTS, TOTAL_PHOTOS, FLOOR_IMAGES, PAGE_LABELS, type PhotoPoint } from './photoPoints';
+import CameraModal from './CameraModal';
+import { submitDokumentasiBangunan, fetchDokumentasiBangunanPrefillOptions, fetchDokumentasiBangunanList } from '@/lib/api';
+import { canViewAllBranches, isViewOnlyUser } from '@/lib/constants';
+
+
+// =============================================================================
+// TYPES
+// =============================================================================
+type PhotoData = { url: string; note: string | null; timestamp: string };
+type FormData = {
+    jenisToko: 'REGULAR' | 'FRANCHISE';
+    cabang: string; nomorUlok: string; kontraktor: string;
+    spkAwal: string; spkAkhir: string; kodeToko: string; namaToko: string;
+    tanggalGo: string; tanggalSt: string; tanggalAmbilFoto: string;
+};
+
+type UlokOption = {
+    nomorUlok: string; kontraktor: string;
+    spkAwal: string; spkAkhir: string; kodeToko: string; namaToko: string;
+    tanggalSt: string;
+    tanggalStSource: 'SERAH_TERIMA' | 'NEEDS_ST';
+    cabang: string;
+};
+
+const todayLocalIso = () => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+};
+
+const emptyForm: FormData = {
+    jenisToko: 'REGULAR',
+    cabang: '', nomorUlok: '', kontraktor: '',
+    spkAwal: '', spkAkhir: '', kodeToko: '', namaToko: '',
+    tanggalGo: '', tanggalSt: '', tanggalAmbilFoto: '',
+};
+
+// =============================================================================
+// MAIN PAGE
+// =============================================================================
+
+export default function FTDokumenPage() {
+    const { showAlert } = useGlobalAlert();
+    const [currentStep, setCurrentStep] = useState<'form' | 'floorplan'>('form');
+    const [formData, setFormData] = useState<FormData>(emptyForm);
+    const [photos, setPhotos] = useState<Record<number, PhotoData>>({});
+    const [currentPhotoNumber, setCurrentPhotoNumber] = useState(1);
+    const [currentPage, setCurrentPage] = useState(1);
+    const [cameraPoint, setCameraPoint] = useState<PhotoPoint | null>(null);
+    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [ulokOptions, setUlokOptions] = useState<UlokOption[]>([]);
+    const [isLoadingUlok, setIsLoadingUlok] = useState(true);
+    const [submittedUloks, setSubmittedUloks] = useState<Set<string>>(new Set());
+
+    const { user } = useSession();
+    const isSuperHuman = user?.isSuperHuman ?? false;
+    const isReadOnly = isViewOnlyUser(user?.roles, isSuperHuman);
+
+    // Populate cabang from session + fetch ULOK data from SPK list
+    useEffect(() => {
+        if (!user) return;
+
+        setFormData(prev => ({ ...prev, cabang: user.cabang, tanggalAmbilFoto: prev.tanggalAmbilFoto || todayLocalIso() }));
+
+        const loadUlokData = async () => {
+            setIsLoadingUlok(true);
+            try {
+                // Ambil data prefill lintas RAB/SPK/ST dan Dokumentasi Bangunan
+                const [prefillRes, dokRes] = await Promise.all([
+                    fetchDokumentasiBangunanPrefillOptions(
+                        canViewAllBranches(user.roles, user.isSuperHuman ?? false)
+                            ? undefined
+                            : { cabang: user.cabang }
+                    ),
+                    fetchDokumentasiBangunanList()
+                ]);
+                const prefillList = prefillRes.data || [];
+                const dokList = dokRes.data || [];
+
+                // Kumpulkan ULOK yang sudah pernah submit
+                const submittedUlokSet = new Set(
+                    dokList
+                        .map((d) => String(d.nomor_ulok || '').trim().toUpperCase())
+                        .filter(Boolean)
+                );
+                setSubmittedUloks(submittedUlokSet);
+
+                const options: UlokOption[] = [];
+
+                for (const item of prefillList) {
+                    const ulok = item.nomor_ulok;
+                    if (!ulok || submittedUlokSet.has(String(ulok).trim().toUpperCase())) continue;
+
+                    // Filter based on user branch
+                    const rabCabang = item.cabang || '';
+                    if (!canViewAllBranches(user.roles, user.isSuperHuman ?? false)) {
+                        if (rabCabang.toUpperCase() !== user.cabang.toUpperCase()) {
+                            continue;
+                        }
+                    }
+
+                    options.push({
+                        nomorUlok: ulok,
+                        kontraktor: item.kontraktor || item.kontraktor_sipil || item.kontraktor_me || '',
+                        spkAwal: item.spk_awal || '',
+                        spkAkhir: item.spk_akhir || '',
+                        tanggalSt: item.tanggal_serah_terima || '',
+                        tanggalStSource: item.tanggal_serah_terima_source,
+                        kodeToko: item.kode_toko || '',
+                        namaToko: item.nama_toko || '',
+                        cabang: rabCabang,
+                    });
+                }
+
+                setUlokOptions(options);
+                if (options.length === 0) {
+                    showAlert({ message: 'Tidak ada data proyek/RAB yang terdaftar.', type: 'warning' });
+                }
+            } catch (err) {
+                console.error('Gagal memuat data ULOK:', err);
+                showAlert({ message: 'Gagal memuat daftar ULOK dari server.', type: 'error' });
+            } finally {
+                setIsLoadingUlok(false);
+            }
+        };
+
+        loadUlokData();
+    }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
+
+    const completedCount = Object.keys(photos).length;
+    const progressPct = Math.round((completedCount / TOTAL_PHOTOS) * 100);
+
+    const handleFormChange = (field: keyof FormData, value: string) => {
+        setFormData(prev => ({ ...prev, [field]: value }));
+    };
+
+    const handleFormSubmit = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (isReadOnly) {
+            showAlert({ message: 'Role ini hanya memiliki akses view.', type: 'warning' });
+            return;
+        }
+        if (!formData.nomorUlok) { showAlert({ message: 'Pilih Nomor ULOK terlebih dahulu.', type: 'warning' }); return; }
+        if (!formData.namaToko) { showAlert({ message: 'Isi Nama Toko.', type: 'warning' }); return; }
+        const selectedUlok = ulokOptions.find(u => u.nomorUlok === formData.nomorUlok);
+        if (formData.jenisToko === 'REGULAR' && selectedUlok?.tanggalStSource === 'NEEDS_ST') {
+            showAlert({ message: 'ST harus dibuat terlebih dahulu untuk ULOK ini.', type: 'warning' });
+            return;
+        }
+        if (!formData.tanggalSt) { showAlert({ message: 'Tanggal ST wajib terisi.', type: 'warning' }); return; }
+        if (formData.jenisToko === 'FRANCHISE' && submittedUloks.has(formData.nomorUlok.trim().toUpperCase())) {
+            showAlert({ message: 'Nomor ULOK ini sudah pernah dibuat dokumentasi.', type: 'warning' });
+            return;
+        }
+        setCurrentStep('floorplan');
+    };
+
+    const handleCapture = (pointId: number, data: PhotoData) => {
+        setPhotos(prev => ({ ...prev, [pointId]: data }));
+        if (pointId === currentPhotoNumber) {
+            let next = pointId + 1;
+            while (next <= TOTAL_PHOTOS && photos[next]) next++;
+            setCurrentPhotoNumber(Math.min(next, TOTAL_PHOTOS));
+        }
+        setCameraPoint(null);
+        showAlert({ message: `Foto #${pointId} berhasil disimpan!`, type: 'success' });
+    };
+
+    const handleDeletePhoto = (pointId: number) => {
+        setPhotos(prev => {
+            const next = { ...prev };
+            delete next[pointId];
+            return next;
+        });
+    };
+
+    const handleSavePdf = async () => {
+        if (isReadOnly) {
+            showAlert({ message: 'Role ini hanya memiliki akses view.', type: 'warning' });
+            return;
+        }
+        if (completedCount < TOTAL_PHOTOS) {
+            showAlert({ message: `Mohon lengkapi seluruh ${TOTAL_PHOTOS} foto sebelum menyimpan.`, type: 'warning' });
+            return;
+        }
+
+        setIsSubmitting(true);
+        try {
+            const sudutItems = Object.keys(photos).map(idStr => {
+                const id = parseInt(idStr);
+                const pt = ALL_POINTS.find(p => p.id === id);
+                return {
+                    item_index: id,
+                    sudut_foto: pt ? pt.label : `Foto ${id}`
+                };
+            });
+
+            const payloadFields: Record<string, string> = {
+                jenis_toko: formData.jenisToko,
+                cabang: formData.cabang,
+                nomor_ulok: formData.nomorUlok,
+                kontraktor_sipil: formData.kontraktor,
+                kontraktor_me: formData.kontraktor,
+                spk_awal: formData.spkAwal,
+                spk_akhir: formData.spkAkhir,
+                kode_toko: formData.kodeToko,
+                nama_toko: formData.namaToko,
+                tanggal_go: formData.tanggalGo,
+                tanggal_serah_terima: formData.tanggalSt,
+                tanggal_ambil_foto: formData.tanggalAmbilFoto,
+                email_pengirim: user?.email || '',
+                status_validasi: 'submitted',
+                pic_dokumentasi: user?.namaLengkap || user?.email?.split('@')[0] || 'PIC',
+                sudut_foto_items: JSON.stringify(sudutItems)
+            };
+
+            await submitDokumentasiBangunan(payloadFields, photos);
+            showAlert({ message: 'Dokumentasi berhasil disimpan dan sedang diproses!', type: 'success' });
+            
+            // Reset form
+            setFormData({ ...emptyForm, cabang: user?.cabang || '', tanggalAmbilFoto: todayLocalIso() });
+            setPhotos({});
+            setCurrentStep('form');
+            setCurrentPage(1);
+            setCurrentPhotoNumber(1);
+        } catch (error: unknown) {
+            const message = error instanceof Error ? error.message : 'Gagal menyimpan dokumentasi.';
+            showAlert({ message, type: 'error' });
+        } finally {
+            setIsSubmitting(false);
+        }
+    };
+
+    return (
+        <>
+            <AppNavbar title="Dokumentasi Bangunan Toko Baru" showBackButton backHref="/dashboard" />
+
+            <main className="max-w-6xl mx-auto p-4 md:p-8 mt-4 pb-24">
+                {currentStep === 'form' ? (
+                    <DataFormView
+                        formData={formData}
+                        onChange={handleFormChange}
+                        onSubmit={handleFormSubmit}
+                        setFormData={setFormData}
+                        ulokOptions={ulokOptions}
+                        isLoadingUlok={isLoadingUlok}
+                        isReadOnly={isReadOnly}
+                        defaultCabang={user?.cabang || ''}
+                    />
+                ) : (
+                    <FloorPlanView
+                        formData={formData}
+                        photos={photos}
+                        currentPage={currentPage}
+                        setCurrentPage={setCurrentPage}
+                        currentPhotoNumber={currentPhotoNumber}
+                        completedCount={completedCount}
+                        progressPct={progressPct}
+                        isSubmitting={isSubmitting}
+                        onBack={() => setCurrentStep('form')}
+                        onPointClick={(p) => !isReadOnly && setCameraPoint(p)}
+                        onSavePdf={handleSavePdf}
+                    />
+                )}
+            </main>
+
+            {cameraPoint && (
+                <CameraModal
+                    point={cameraPoint}
+                    existingPhoto={photos[cameraPoint.id] || null}
+                    onClose={() => setCameraPoint(null)}
+                    onCapture={handleCapture}
+                    onDelete={handleDeletePhoto}
+                />
+            )}
+        </>
+    );
+}
+
+// =============================================================================
+// DATA FORM VIEW
+// =============================================================================
+function DataFormView({ formData, onChange, onSubmit, setFormData, ulokOptions, isLoadingUlok, isReadOnly, defaultCabang }: {
+    formData: FormData;
+    onChange: (field: keyof FormData, value: string) => void;
+    onSubmit: (e: React.FormEvent) => void;
+    setFormData: React.Dispatch<React.SetStateAction<FormData>>;
+    ulokOptions: UlokOption[];
+    isLoadingUlok: boolean;
+    isReadOnly: boolean;
+    defaultCabang: string;
+}) {
+    const [searchQuery, setSearchQuery] = useState('');
+    const [ulokDropdownOpen, setUlokDropdownOpen] = useState(false);
+    const ulokDropdownRef = useRef<HTMLDivElement | null>(null);
+    const isFranchise = formData.jenisToko === 'FRANCHISE';
+    const selectedUlok = useMemo(
+        () => ulokOptions.find(u => u.nomorUlok === formData.nomorUlok),
+        [formData.nomorUlok, ulokOptions]
+    );
+
+    const filteredUlokOptions = useMemo(() => {
+        if (!searchQuery) return ulokOptions;
+        const q = searchQuery.toLowerCase();
+        return ulokOptions.filter(u => 
+            (u.nomorUlok || '').toLowerCase().includes(q) || 
+            (u.namaToko || '').toLowerCase().includes(q) ||
+            (u.kodeToko || '').toLowerCase().includes(q)
+        );
+    }, [ulokOptions, searchQuery]);
+
+    useEffect(() => {
+        const handleClickOutside = (event: MouseEvent | TouchEvent) => {
+            if (!ulokDropdownRef.current?.contains(event.target as Node)) {
+                setUlokDropdownOpen(false);
+            }
+        };
+
+        document.addEventListener('mousedown', handleClickOutside);
+        document.addEventListener('touchstart', handleClickOutside);
+
+        return () => {
+            document.removeEventListener('mousedown', handleClickOutside);
+            document.removeEventListener('touchstart', handleClickOutside);
+        };
+    }, []);
+
+    const handleUlokSelect = (val: string) => {
+        const selected = ulokOptions.find(u => u.nomorUlok === val);
+        if (selected) {
+            setFormData(prev => ({
+                ...prev,
+                jenisToko: 'REGULAR',
+                nomorUlok: selected.nomorUlok,
+                kontraktor: selected.kontraktor,
+                spkAwal: selected.spkAwal,
+                spkAkhir: selected.spkAkhir,
+                tanggalSt: selected.tanggalSt,
+                tanggalAmbilFoto: prev.tanggalAmbilFoto || todayLocalIso(),
+                kodeToko: selected.kodeToko,
+                namaToko: selected.namaToko,
+                cabang: selected.cabang || prev.cabang,
+            }));
+            setSearchQuery('');
+            setUlokDropdownOpen(false);
+        } else {
+            onChange('nomorUlok', val);
+        }
+    };
+
+    const handleFranchiseToggle = (checked: boolean | 'indeterminate') => {
+        const enabled = checked === true;
+        setSearchQuery('');
+        setUlokDropdownOpen(false);
+        setFormData(prev => ({
+            ...prev,
+            jenisToko: enabled ? 'FRANCHISE' : 'REGULAR',
+            cabang: enabled ? prev.cabang : defaultCabang,
+            nomorUlok: '',
+            kontraktor: '',
+            spkAwal: '',
+            spkAkhir: '',
+            tanggalSt: '',
+            kodeToko: '',
+            namaToko: '',
+        }));
+    };
+
+    const autoInputClass = "bg-slate-100 text-slate-600 cursor-not-allowed border-slate-200";
+    const manualInputClass = "bg-white border-slate-300 focus-visible:ring-red-100 focus-visible:border-red-400";
+
+    return (
+        <Card className="mb-8 shadow-sm border-slate-200">
+            <CardHeader className="border-b bg-slate-50/50 pb-4">
+                <CardTitle className="text-red-700 flex items-center gap-2">
+                    <FileText className="w-5 h-5" /> Data & Identitas Proyek
+                </CardTitle>
+            </CardHeader>
+            <CardContent className="pt-6">
+                <form onSubmit={onSubmit}>
+                    <div className={`mb-6 rounded-lg border px-4 py-3 transition-colors ${isFranchise ? 'border-red-200 bg-red-50/70' : 'border-slate-200 bg-white'}`}>
+                        <label className="flex cursor-pointer items-start gap-3">
+                            <Checkbox
+                                checked={isFranchise}
+                                onCheckedChange={handleFranchiseToggle}
+                                disabled={isReadOnly}
+                                className="mt-1 data-checked:bg-red-600 data-checked:border-red-600"
+                            />
+                            <span className="flex-1">
+                                <span className="flex items-center gap-2 text-sm font-bold text-slate-900">
+                                    {isFranchise ? <PencilLine className="h-4 w-4 text-red-600" /> : <Store className="h-4 w-4 text-slate-500" />}
+                                    Toko Franchise
+                                </span>
+                                <span className="mt-0.5 block text-xs leading-5 text-slate-500">
+                                    Centang jika toko tidak berasal dari RAB. Data identitas proyek akan diisi manual, dengan Nomor ULOK tetap wajib.
+                                </span>
+                            </span>
+                        </label>
+                    </div>
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        <div className="space-y-2">
+                            <Label>Nomor ULOK <span className="text-red-500">*</span></Label>
+                            {isFranchise ? (
+                                <Input
+                                    value={formData.nomorUlok}
+                                    onChange={(e) => onChange('nomorUlok', e.target.value.toUpperCase())}
+                                    disabled={isReadOnly}
+                                    className={manualInputClass}
+                                    placeholder="Input Nomor ULOK"
+                                />
+                            ) : isLoadingUlok ? (
+                                <div className="flex items-center gap-2 h-10 px-3 rounded-md border border-slate-200 bg-slate-50 text-sm text-slate-400">
+                                    <Loader2 className="w-4 h-4 animate-spin" /> Memuat daftar ULOK...
+                                </div>
+                            ) : (
+                                <div className="relative" ref={ulokDropdownRef}>
+                                    <button
+                                        type="button"
+                                        disabled={isReadOnly}
+                                        onClick={() => setUlokDropdownOpen(open => !open)}
+                                        className="flex min-h-10 w-full items-center justify-between gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 text-left text-sm text-slate-700 shadow-sm disabled:cursor-not-allowed disabled:opacity-50"
+                                    >
+                                        <span className="whitespace-normal wrap-break-word">
+                                            {formData.nomorUlok || '-- Pilih Nomor ULOK --'}
+                                        </span>
+                                        <ChevronDown className="h-4 w-4 shrink-0 text-slate-500" />
+                                    </button>
+
+                                    {ulokDropdownOpen && (
+                                        <div className="absolute z-50 mt-1 w-full max-h-75 overflow-hidden rounded-md border border-slate-200 bg-white shadow-lg">
+                                            <div className="sticky top-0 z-10 border-b border-slate-100 bg-white p-2">
+                                                <div className="relative">
+                                                    <Search className="absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" />
+                                                    <input
+                                                        type="text"
+                                                        inputMode="search"
+                                                        autoComplete="off"
+                                                        placeholder="Cari ULOK / Toko..."
+                                                        className="w-full rounded-md border py-2 pl-8 pr-3 text-sm outline-none focus:border-red-400 focus:ring-1 focus:ring-red-400"
+                                                        value={searchQuery}
+                                                        onChange={(e) => setSearchQuery(e.target.value)}
+                                                    />
+                                                </div>
+                                            </div>
+                                            <div className="max-h-60 overflow-y-auto overscroll-contain">
+                                                {filteredUlokOptions.length > 0 ? (
+                                                    filteredUlokOptions.map(ulok => (
+                                                        <button
+                                                            type="button"
+                                                            key={ulok.nomorUlok}
+                                                            onClick={() => handleUlokSelect(ulok.nomorUlok)}
+                                                            className="block w-full border-b border-slate-100 px-3 py-2 text-left text-sm text-slate-700 last:border-b-0 hover:bg-red-50 focus:bg-red-50 focus:outline-none"
+                                                        >
+                                                            <span className="font-semibold">{ulok.nomorUlok}</span>
+                                                            <span className="text-slate-500"> - {ulok.namaToko || ulok.kodeToko}</span>
+                                                        </button>
+                                                    ))
+                                                ) : (
+                                                    <div className="px-3 py-3 text-sm text-slate-500">ULOK / toko tidak ditemukan.</div>
+                                                )}
+                                            </div>
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                        <div className="space-y-2 lg:col-span-2">
+                            <Label>Kontraktor</Label>
+                            <Input
+                                readOnly={!isFranchise}
+                                value={formData.kontraktor}
+                                onChange={(e) => onChange('kontraktor', e.target.value)}
+                                disabled={isReadOnly}
+                                className={isFranchise ? manualInputClass : autoInputClass}
+                                placeholder={isFranchise ? "Input kontraktor" : "Terisi otomatis"}
+                                tabIndex={isFranchise ? 0 : -1}
+                            />
+                        </div>
+                        <div className="space-y-2">
+                            <Label>SPK Awal</Label>
+                            <DatePicker value={formData.spkAwal} onChange={val => onChange('spkAwal', val)} disabled={isReadOnly || !isFranchise} />
+                        </div>
+                        <div className="space-y-2">
+                            <Label>SPK Akhir</Label>
+                            <DatePicker value={formData.spkAkhir} onChange={val => onChange('spkAkhir', val)} disabled={isReadOnly || !isFranchise} />
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Kode Toko</Label>
+                            <Input
+                                readOnly={!isFranchise}
+                                value={formData.kodeToko}
+                                onChange={(e) => onChange('kodeToko', e.target.value.toUpperCase())}
+                                disabled={isReadOnly}
+                                className={`${isFranchise ? manualInputClass : autoInputClass} font-bold`}
+                                placeholder={isFranchise ? "Input kode toko" : "Terisi otomatis"}
+                                tabIndex={isFranchise ? 0 : -1}
+                            />
+                        </div>
+                        <div className="space-y-2 lg:col-span-3">
+                            <Label>Nama Toko <span className="text-red-500">*</span></Label>
+                            <Input
+                                readOnly={!isFranchise}
+                                value={formData.namaToko}
+                                onChange={(e) => onChange('namaToko', e.target.value)}
+                                disabled={isReadOnly}
+                                className={`${isFranchise ? manualInputClass : autoInputClass} font-bold`}
+                                placeholder={isFranchise ? "Input nama toko" : "Terisi otomatis"}
+                                tabIndex={isFranchise ? 0 : -1}
+                            />
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Tanggal GO <span className="text-red-500">*</span></Label>
+                            <DatePicker value={formData.tanggalGo} onChange={val => onChange('tanggalGo', val)} disabled={isReadOnly} />
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Tanggal ST <span className="text-red-500">*</span></Label>
+                            <DatePicker
+                                value={formData.tanggalSt}
+                                onChange={val => onChange('tanggalSt', val)}
+                                disabled={isReadOnly || (!isFranchise && Boolean(selectedUlok?.tanggalStSource))}
+                                placeholder={selectedUlok?.tanggalStSource === 'NEEDS_ST' ? 'ST harus dibuat' : 'Pilih tanggal'}
+                            />
+                            {!isFranchise && selectedUlok?.tanggalStSource === 'NEEDS_ST' && (
+                                <p className="text-xs font-semibold text-red-600">ST harus dibuat</p>
+                            )}
+                        </div>
+                        <div className="space-y-2">
+                            <Label>Tanggal Ambil Foto <span className="text-red-500">*</span></Label>
+                            <DatePicker value={formData.tanggalAmbilFoto} onChange={val => onChange('tanggalAmbilFoto', val)} disabled={isReadOnly} />
+                        </div>
+                    </div>
+                    <div className="flex justify-end mt-8 border-t border-slate-100 pt-6">
+                        <Button type="submit" disabled={isReadOnly} className="bg-red-600 hover:bg-red-700 text-white font-bold px-8 py-2.5">
+                            <ArrowRight className="w-4 h-4 mr-2" /> Lanjut ke Denah & Foto
+                        </Button>
+                    </div>
+                </form>
+            </CardContent>
+        </Card>
+    );
+}
+
+// =============================================================================
+// FLOOR PLAN VIEW
+// =============================================================================
+function FloorPlanView({ formData, photos, currentPage, setCurrentPage, currentPhotoNumber, completedCount, progressPct, isSubmitting, onBack, onPointClick, onSavePdf }: {
+    formData: FormData; photos: Record<number, PhotoData>;
+    currentPage: number; setCurrentPage: (p: number) => void;
+    currentPhotoNumber: number; completedCount: number; progressPct: number;
+    isSubmitting: boolean;
+    onBack: () => void; onPointClick: (p: PhotoPoint) => void; onSavePdf: () => void;
+}) {
+    const pagePoints = PHOTO_POINTS[currentPage] || [];
+
+    return (
+        <Card className="shadow-sm border-slate-200">
+            {/* Header */}
+            <div className="p-5 border-b border-slate-100 bg-white rounded-t-xl">
+                <div className="flex justify-between items-center mb-4">
+                    <button onClick={onBack} className="text-red-600 font-semibold text-sm flex items-center gap-1 hover:underline">
+                        <ArrowLeft className="w-4 h-4" /> Kembali ke Data
+                    </button>
+                    <div className="text-right">
+                        <div className="font-bold text-red-600">{formData.namaToko || '-'} ({formData.kodeToko || '-'})</div>
+                        <div className="text-xs text-slate-500">{formData.tanggalAmbilFoto || '-'}</div>
+                    </div>
+                </div>
+                {/* Progress */}
+                <div className="bg-slate-100 h-2.5 rounded-full overflow-hidden mb-1">
+                    <div className="bg-green-500 h-full rounded-full transition-all duration-500" style={{ width: `${progressPct}%` }} />
+                </div>
+                <div className="text-right text-xs text-slate-500 font-medium">Progress: {completedCount}/{TOTAL_PHOTOS} foto</div>
+            </div>
+
+            <CardContent className="p-5">
+                <div className="grid grid-cols-1 lg:grid-cols-[2.5fr_1fr] gap-5">
+                    {/* Left: Floor plan */}
+                    <div className="bg-slate-50 rounded-xl p-4 border border-slate-200">
+                        {/* Page tabs */}
+                        <div className="flex justify-center gap-2 mb-4 flex-wrap">
+                            {Object.keys(PHOTO_POINTS).map(Number).sort((a, b) => a - b).map(pg => (
+                                <button key={pg} onClick={() => setCurrentPage(pg)}
+                                    className={`px-4 py-2 rounded-lg text-sm font-bold transition-all ${currentPage === pg ? 'bg-red-600 text-white shadow-md' : 'bg-white text-slate-600 border border-slate-200 hover:border-red-300'}`}>
+                                    {pg}. {PAGE_LABELS[pg]}
+                                </button>
+                            ))}
+                        </div>
+
+                        {/* Denah image with points */}
+                        <div className="relative w-full" style={{ paddingTop: '75%' }}>
+                            <img src={FLOOR_IMAGES[currentPage]} alt={`Denah ${PAGE_LABELS[currentPage]}`}
+                                className="absolute inset-0 w-full h-full object-contain rounded" />
+                            {pagePoints.map(p => {
+                                const done = !!photos[p.id];
+                                const isActive = p.id === currentPhotoNumber;
+                                const isLocked = !done && p.id > currentPhotoNumber;
+                                const isMissed = !done && p.id < currentPhotoNumber;
+
+                                let bg = 'bg-slate-400'; // pending
+                                if (done) bg = 'bg-emerald-600';
+                                else if (isActive) bg = 'bg-green-500 animate-pulse';
+                                else if (isMissed) bg = 'bg-slate-400 opacity-50';
+
+                                return (
+                                    <button key={p.id} title={done ? `✓ ${p.label}` : p.label}
+                                        disabled={isLocked}
+                                        onClick={() => onPointClick(p)}
+                                        className={`absolute w-5 h-5 md:w-4 md:h-4 rounded-full flex items-center justify-center text-[8px] md:text-[7px] font-bold text-white border-2 border-white shadow-md transition-all hover:scale-125 z-10 ${bg} ${isLocked ? 'cursor-not-allowed opacity-40' : 'cursor-pointer'}`}
+                                        style={{ left: `${p.x}%`, top: `${p.y}%`, transform: 'translate(-50%, -50%)' }}>
+                                        {p.id}
+                                        {done && (
+                                            <span className="absolute -top-1 -right-1 w-2.5 h-2.5 bg-white text-emerald-600 rounded-full flex items-center justify-center text-[6px] font-bold shadow">✓</span>
+                                        )}
+                                    </button>
+                                );
+                            })}
+                        </div>
+                    </div>
+
+                    {/* Right: Photo list */}
+                    <div className="bg-slate-50 rounded-xl p-4 border border-slate-200 flex flex-col max-h-150">
+                        <h3 className="font-bold text-red-600 text-sm mb-3 flex items-center gap-1.5">
+                            <ImageIcon className="w-4 h-4" /> Daftar Foto ({completedCount}/{TOTAL_PHOTOS})
+                        </h3>
+                        <div className="flex-1 overflow-y-auto space-y-2 pr-1 custom-scrollbar">
+                            {pagePoints.map(p => {
+                                const photo = photos[p.id];
+                                return (
+                                    <div key={p.id}
+                                        onClick={() => { if (!(!photo && p.id > currentPhotoNumber)) onPointClick(p); }}
+                                        className={`p-3 rounded-lg border-2 transition cursor-pointer text-xs ${photo
+                                            ? 'border-l-4 border-l-green-500 border-slate-200 bg-green-50'
+                                            : p.id === currentPhotoNumber
+                                                ? 'border-red-300 bg-red-50'
+                                                : 'border-slate-200 bg-white opacity-60'
+                                            }`}>
+                                        <div className="font-bold text-red-600">{p.id}</div>
+                                        <div className="text-slate-600 text-[11px] leading-tight">{p.label}</div>
+                                        {photo?.note && (
+                                            <div className="mt-1 text-[10px] text-red-600 border border-red-300 rounded px-1.5 py-0.5 text-center font-semibold">
+                                                {photo.note}
+                                            </div>
+                                        )}
+                                        {photo && photo.url && (
+                                            <img src={photo.url} alt={`Foto ${p.id}`} className="w-full h-12 object-cover rounded mt-1.5" />
+                                        )}
+                                    </div>
+                                );
+                            })}
+                        </div>
+
+                        <div className="mt-4 pt-3 border-t border-slate-200">
+                            <Button onClick={onSavePdf} disabled={isSubmitting} className="w-full bg-red-600 hover:bg-red-700 text-white font-bold shadow-md">
+                                {isSubmitting ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <FileText className="w-4 h-4 mr-2" />}
+                                {isSubmitting ? 'Menyimpan...' : 'Simpan & Kirim PDF'}
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+
+                {/* Completion banner */}
+                {completedCount === TOTAL_PHOTOS && (
+                    <div className="mt-6 p-4 bg-green-50 border border-green-200 rounded-xl text-center">
+                        <CheckCircle className="w-8 h-8 text-green-600 mx-auto mb-2" />
+                        <h3 className="font-bold text-green-800">Semua Foto Lengkap! 🎉</h3>
+                        <p className="text-sm text-green-600">Silakan tekan tombol &quot;Simpan & Kirim PDF&quot; di atas.</p>
+                    </div>
+                )}
+            </CardContent>
+        </Card>
+    );
+}

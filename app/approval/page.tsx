@@ -1,0 +1,3485 @@
+"use client"
+
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useSession } from '@/context/SessionContext';
+import { Card, CardContent } from '@/components/ui/card';
+import { Button } from '@/components/ui/button';
+import { Badge } from '@/components/ui/badge';
+import {
+    ArrowLeft, Loader2, CheckCircle, XCircle,
+    Search, FileText, ClipboardList, Eye,
+    AlertTriangle, FileDown, Building2, CalendarDays, User, RefreshCw, Plus
+} from 'lucide-react';
+import AppNavbar from '@/components/AppNavbar';
+import GanttViewer from '@/components/GanttViewer';
+
+import {
+    // RAB
+    fetchRABList, fetchRABDetail, processRABApproval, downloadRABPdf,
+    type RABListItem, type RABDetailItem,
+    fetchUserCabangList,
+    // SPK
+    fetchSPKList, fetchSPKDetail, processSPKApproval, downloadSPKPdf,
+    type SPKListItem,
+    // Pertambahan SPK
+    fetchPertambahanSPKList, fetchPertambahanSPKDetail, processPertambahanSPKApproval, downloadPertambahanSPKPdf,
+    type PertambahanSPKListItem, type PertambahanSPKDetailResponse,
+    // Opname Final
+    fetchOpnameFinalList, fetchOpnameFinalDetail, approveOpnameFinal, downloadOpnameFinalPdf,
+    sendEmailNotification,
+    fetchProjekPlanningList,
+    downloadSerahTerimaPdf,
+    type ProjekPlanningItem,
+} from '@/lib/api';
+import {
+    fetchInstruksiLapanganList, fetchInstruksiLapanganDetail,
+    processInstruksiLapanganApproval, downloadInstruksiLapanganPdf
+} from '@/lib/api';
+import {
+    fetchDendaActions, approveDendaAction, rejectDendaAction,
+    type DendaAction,
+} from '@/lib/denda-actions-api';
+import {
+    downloadRequestIntervensiPdf,
+    downloadRequestIntervensiLampiran,
+    fetchRequestIntervensiDetail,
+    fetchRequestIntervensiList,
+    processRequestIntervensiApproval,
+    REQUEST_INTERVENSI_LABELS,
+    type RequestIntervensi,
+} from '@/lib/request-intervensi-api';
+
+import { parseCurrency } from '@/lib/utils';
+import { calculateEffectiveStDate, toIsoDate } from '@/lib/gantt-calculator';
+import {
+    API_URL,
+    BRANCH_TO_ULOK,
+    canApproveAllBranches,
+    isViewOnlyUser,
+    canAccessBranchForUser,
+    getAccessibleBranchesForUser,
+    getSessionBranchCoverage,
+    getParentBranch,
+} from '@/lib/constants';
+import {
+    EMPTY_APPROVAL_COUNTS,
+    fetchApprovalNotificationCounts,
+    getApprovalNotificationTotal,
+    type ApprovalCounts,
+} from '@/lib/approval-notifications';
+
+// =============================================
+// TYPES INTERNAL
+// =============================================
+type ApprovalType = 'RAB' | 'SPK' | 'PERTAMBAHAN_SPK' | 'OPNAME' | 'INSTRUKSI_LAPANGAN' | 'PROJECT_PLANNING' | 'SURAT_PERINGATAN' | 'INTERVENSI';
+type ActiveView = 'menu' | 'list' | 'detail';
+type RabBeanspotType = '' | 'TIDAK' | 'ADVANCE' | 'MEDIUM' | 'RTD_ONLY';
+type YesNoValue = '' | 'YA' | 'TIDAK';
+
+const RAB_BEANSPOT_OPTIONS: Array<{ value: Exclude<RabBeanspotType, ''>; label: string }> = [
+    { value: 'TIDAK', label: 'Tidak' },
+    { value: 'ADVANCE', label: 'Advance' },
+    { value: 'MEDIUM', label: 'Medium' },
+    { value: 'RTD_ONLY', label: 'RTD Only' },
+];
+
+const EMPTY_RAB_COORDINATOR_INFO = {
+    beanspot_type: '' as RabBeanspotType,
+    hth: '' as YesNoValue,
+    hth_meter: '',
+    fasade: '' as YesNoValue,
+};
+
+type RabCoordinatorInfoPayload = {
+    beanspot_type: Exclude<RabBeanspotType, ''>;
+    is_hth: boolean;
+    hth_meter: number | null;
+    is_fasade: boolean;
+};
+
+const toRabCoordinatorInfoState = (input?: {
+    beanspot_type?: string | null;
+    is_hth?: boolean | null;
+    hth_meter?: string | number | null;
+    is_fasade?: boolean | null;
+} | null) => {
+    const beanspot = String(input?.beanspot_type ?? '').trim().toUpperCase();
+    const validBeanspot = RAB_BEANSPOT_OPTIONS.some(option => option.value === beanspot)
+        ? beanspot as RabBeanspotType
+        : '';
+
+    return {
+        beanspot_type: validBeanspot,
+        hth: input?.is_hth === true ? 'YA' as YesNoValue : input?.is_hth === false ? 'TIDAK' as YesNoValue : '',
+        hth_meter: input?.is_hth === true && input?.hth_meter != null ? String(input.hth_meter) : '',
+        fasade: input?.is_fasade === true ? 'YA' as YesNoValue : input?.is_fasade === false ? 'TIDAK' as YesNoValue : '',
+    };
+};
+
+
+interface NormalizedListItem {
+    id: number;
+    id_toko?: number;
+    tipe: ApprovalType;
+    nomor_ulok: string;
+    nama_toko: string;
+    cabang: string;
+    status: string;
+    total_nilai: number;
+    email_pembuat: string;
+    created_at: string;
+    _raw: RABListItem | SPKListItem | PertambahanSPKListItem | any;
+    // Pertambahan SPK specific
+    pertambahan_hari?: string;
+    nomor_spk?: string;
+    alasan_perpanjangan?: string;
+    hari_denda?: number;
+    nilai_denda?: string;
+}
+
+interface NormalizedDetail {
+    id: number;
+    tipe: ApprovalType;
+    nomor_ulok: string;
+    id_toko?: number;
+    nama_toko: string;
+    kode_toko?: string;
+    alamat?: string;
+    cabang: string;
+    lingkup_pekerjaan?: string;
+    status: string;
+    total_nilai: number;
+    email_pembuat: string;
+    created_at: string;
+    alasan_penolakan?: string | null;
+    // Approval trail (RAB & IL)
+    // Approval trail (RAB & IL)
+    approval_koordinator?: { pemberi: string | null; waktu: string | null; catatan?: string | null };
+    approval_manager?: { pemberi: string | null; waktu: string | null; catatan?: string | null };
+    approval_direktur?: { pemberi: string | null; waktu: string | null; catatan?: string | null };
+    // RAB coordinator info (beanspot, HTH, fasade) - hanya untuk manager
+    beanspot_type?: string | null;
+    is_hth?: boolean | null;
+    hth_meter?: string | number | null;
+    is_fasade?: boolean | null;
+    // SPK specific
+    nama_kontraktor?: string;
+    durasi?: number;
+    waktu_mulai?: string;
+    waktu_selesai?: string;
+    st_target_date?: string | null;
+    st_offset_days?: number;
+    st_offset_label?: string | null;
+    st_offset_explanation?: string | null;
+    nilai_kontrak?: number;
+    // PDF
+    link_pdf_gabungan?: string | null;
+    link_lampiran_pendukung?: string | null;
+    // Items
+    items: Array<{
+        id: number;
+        kategori: string;
+        jenis_pekerjaan: string;
+        satuan: string;
+        volume: number;
+        harga_material: number;
+        harga_upah: number;
+        total: number;
+        desain?: string | null;
+        kualitas?: string | null;
+        spesifikasi?: string | null;
+        catatan?: string | null;
+        foto?: string | null;
+    }>;
+    // Pertambahan SPK specific
+    pertambahan_hari?: string;
+    tanggal_spk_akhir?: string;
+    tanggal_spk_akhir_setelah_perpanjangan?: string;
+    alasan_perpanjangan?: string;
+    nomor_spk?: string;
+    nomor_spk_sipil?: string | null;
+    nomor_spk_me?: string | null;
+    link_pdf?: string | null;
+    hari_denda?: number;
+    nilai_denda?: string;
+    tanggal_akhir_spk_denda?: string;
+    tanggal_serah_terima_denda?: string;
+    _raw?: any;
+}
+
+// =============================================
+// UTILS
+// =============================================
+const formatRupiah = (num: number) =>
+    new Intl.NumberFormat("id-ID", { style: "currency", currency: "IDR", minimumFractionDigits: 0 }).format(num || 0);
+
+const formatDate = (dateStr: string) => {
+    if (!dateStr) return '-';
+    try {
+        return new Date(dateStr).toLocaleDateString('id-ID', { day: '2-digit', month: 'long', year: 'numeric' });
+    } catch { return dateStr; }
+};
+
+const buildStTargetDisplay = (endDate?: string | null) => {
+    if (!endDate) {
+        return {
+            st_target_date: null,
+            st_offset_days: 0,
+            st_offset_label: null,
+            st_offset_explanation: null,
+        };
+    }
+    const parsed = new Date(String(endDate).split('T')[0] + 'T00:00:00');
+    if (Number.isNaN(parsed.getTime())) {
+        return {
+            st_target_date: null,
+            st_offset_days: 0,
+            st_offset_label: null,
+            st_offset_explanation: null,
+        };
+    }
+    const target = calculateEffectiveStDate(parsed);
+    return {
+        st_target_date: toIsoDate(target.effectiveStDate),
+        st_offset_days: target.offsetDays,
+        st_offset_label: target.offsetDays > 1 ? target.label : null,
+        st_offset_explanation: target.explanation,
+    };
+};
+
+const normalizeBranch = (branch?: string | null) => (branch ?? '').trim().toUpperCase();
+
+const getFirstNonEmptyString = (...values: unknown[]) => {
+    const value = values.find(v => typeof v === 'string' && v.trim());
+    return typeof value === 'string' ? value.trim() : null;
+};
+
+type ObjectRecord = Record<string, unknown>;
+
+const isObjectRecord = (value: unknown): value is ObjectRecord =>
+    typeof value === 'object' && value !== null;
+
+const getNestedRecord = (source: ObjectRecord, key: string) => {
+    const value = source[key];
+    return isObjectRecord(value) ? value : null;
+};
+
+const getOpnameFinalItems = (payload: unknown) => {
+    if (!isObjectRecord(payload)) return [];
+    if (Array.isArray(payload.items)) return payload.items;
+
+    const toko = getNestedRecord(payload, 'toko');
+    if (Array.isArray(toko?.items)) return toko.items;
+
+    const opnameFinal = getNestedRecord(payload, 'opname_final');
+    if (Array.isArray(opnameFinal?.items)) return opnameFinal.items;
+
+    return [];
+};
+
+// =============================================
+// ROLE CONFIG
+// =============================================
+const ROLE_ACCESS: Record<ApprovalType, string[]> = {
+    RAB: ['BRANCH BUILDING COORDINATOR', 'BRANCH BUILDING & MAINTENANCE MANAGER', 'DIREKTUR KONTRAKTOR', 'DIREKTUR', 'COORDINATOR', 'MANAGER'],
+    SPK: ['BRANCH MANAGER', 'MANAGER'],
+    PERTAMBAHAN_SPK: ['BRANCH MANAGER', 'MANAGER'],
+    OPNAME: ['BRANCH BUILDING COORDINATOR', 'BRANCH BUILDING & MAINTENANCE MANAGER', 'DIREKTUR KONTRAKTOR', 'COORDINATOR', 'MANAGER'],
+    INSTRUKSI_LAPANGAN: ['BRANCH BUILDING COORDINATOR', 'BRANCH BUILDING & MAINTENANCE MANAGER', 'COORDINATOR', 'MANAGER'],
+    PROJECT_PLANNING: ['BRANCH BUILDING & MAINTENANCE MANAGER', 'BUILDING & MAINTENANCE REGIONAL MANAGER', 'PROJECT PLANNING & DEVELOPMENT SPECIALIST', 'PROJECT PLANNING & DEVELOPMENT MANAGER'],
+    SURAT_PERINGATAN: ['BRANCH BUILDING & MAINTENANCE MANAGER'],
+    INTERVENSI: ['BRANCH BUILDING & MAINTENANCE MANAGER', 'STORE & BRANCH CONTROLLING SPECIALIST', 'BUILDING & MAINTENANCE REGIONAL MANAGER', 'MANAGER'],
+};
+
+type ApprovalJabatan = 'KOORDINATOR' | 'MANAGER' | 'DIREKTUR' | 'DIREKTUR_KONTRAKTOR' | 'KONTRAKTOR';
+
+const ROLE_TO_JABATAN: Record<string, ApprovalJabatan> = {
+    'BRANCH BUILDING COORDINATOR':           'KOORDINATOR',
+    'BRANCH BUILDING & MAINTENANCE MANAGER': 'MANAGER',
+    'DIREKTUR KONTRAKTOR':                   'DIREKTUR_KONTRAKTOR',
+    'DIREKTUR':                              'DIREKTUR',
+    'KONTRAKTOR':                            'KONTRAKTOR',
+};
+
+const hasDirectorRole = (roles: string[]) =>
+    roles.some(role => role === 'DIREKTUR' || role === 'DIREKTUR KONTRAKTOR' || role.includes('DIREKTUR'));
+
+const isHeadOfficeDirector = (cabang?: string | null, roles: string[] = []) =>
+    normalizeBranch(cabang) === 'HEAD OFFICE' && hasDirectorRole(roles);
+
+const isContractorCompanyScopedRole = (roles: string[]) =>
+    roles.some(role => role === 'KONTRAKTOR' || role.includes('DIREKTUR KONTRAKTOR'));
+
+const normalizeCompanyName = (value?: string | null) => {
+    if (!value) return '';
+    let normalized = String(value).trim().toUpperCase();
+    
+    // Remove common punctuation and spaces
+    normalized = normalized.replace(/[,.\s]+/g, '');
+    
+    // Remove PT/CV prefix/suffix to handle both "CV NAME" and "NAME, CV" formats
+    normalized = normalized.replace(/^(PT|CV)/g, '').replace(/(PT|CV)$/g, '');
+    
+    return normalized;
+};
+
+const isPendingApprovalStatus = (status?: string | null) => {
+    const upper = String(status ?? '').trim().toUpperCase();
+    return upper.includes('MENUNGGU') || upper.startsWith('PENDING') || upper.startsWith('WAITING');
+};
+
+const isCoordinatorApprovalStatus = (status?: string | null) => {
+    const upper = String(status ?? '').trim().toUpperCase();
+    return upper.includes('KOORDINATOR');
+};
+
+const isManagerApprovalStatus = (status?: string | null) => {
+    const upper = String(status ?? '').trim().toUpperCase();
+    return upper.includes('MANAGER') || upper.includes('MANAJER');
+};
+
+const isDirectorApprovalStatus = (status?: string | null) => {
+    const upper = String(status ?? '').trim().toUpperCase();
+    return upper.includes('DIREKTUR') || upper.includes('DIR.');
+};
+
+const isContractorDirectorApprovalStatus = (status?: string | null) => {
+    const upper = String(status ?? '').trim().toUpperCase();
+    return upper.includes('DIREKTUR KONTRAKTOR') || upper.includes('DIR. KONTRAKTOR') || upper.includes('DIR KONTRAKTOR');
+};
+
+const isDirectorJabatan = (value?: ApprovalJabatan | null) =>
+    value === 'DIREKTUR' || value === 'DIREKTUR_KONTRAKTOR';
+
+const matchesApprovalStage = (jabatan: ApprovalJabatan | null, status?: string | null, tipe?: string | null, cabang?: string | null) => {
+    if (!isPendingApprovalStatus(status)) return false;
+    if (jabatan === 'KOORDINATOR') {
+        const upperCabang = String(cabang ?? '').trim().toUpperCase();
+        if (upperCabang === 'BATAM' && tipe === 'INSTRUKSI_LAPANGAN' && isManagerApprovalStatus(status)) {
+            return true;
+        }
+        return isCoordinatorApprovalStatus(status);
+    }
+    if (jabatan === 'MANAGER') return isManagerApprovalStatus(status);
+    if (jabatan === 'DIREKTUR_KONTRAKTOR') return isContractorDirectorApprovalStatus(status);
+    if (jabatan === 'DIREKTUR') return isDirectorApprovalStatus(status);
+    return true;
+};
+
+const matchesUserCompany = (value: unknown, userCompany?: string | null) => {
+    const normalizedUserCompany = normalizeCompanyName(userCompany);
+    if (!normalizedUserCompany || !value || typeof value !== 'object') return false;
+
+    const source = value as Record<string, any>;
+    
+    // Try multiple possible field locations for company name
+    // For list items (raw API data): source.nama_kontraktor, source.toko.nama_kontraktor
+    // For detail items (mapped data): source.nama_kontraktor directly
+    const candidates = [
+        source.nama_pt,              // RAB field
+        source.nama_kontraktor,      // OPNAME field (both raw and mapped)
+        source.toko?.nama_pt,        // Nested toko object
+        source.toko?.nama_kontraktor,// Nested toko object
+        source.kontraktor,
+        source.pt,
+        source.company,
+        source.nama_perusahaan,
+    ];
+    
+    // Enhanced debug: show complete raw data structure for OPNAME
+    console.log('[matchesUserCompany] Full Raw Data Sample:', {
+        id: source.id,
+        status_opname_final: source.status_opname_final,
+        id_toko: source.id_toko,
+        nama_kontraktor: source.nama_kontraktor,
+        toko_nama_kontraktor: source.toko?.nama_kontraktor,
+        allKeys: Object.keys(source),
+        tokoExists: !!source.toko,
+        tokoKeys: source.toko ? Object.keys(source.toko) : []
+    });
+    
+    console.log('[matchesUserCompany] Matching:', {
+        userCompany: normalizedUserCompany,
+        candidates: candidates.map((c, i) => ({ 
+            index: i,
+            raw: c, 
+            normalized: normalizeCompanyName(c),
+            matches: normalizeCompanyName(c) === normalizedUserCompany
+        }))
+    });
+
+    const match = candidates.some(candidate => normalizeCompanyName(candidate) === normalizedUserCompany);
+    console.log('[matchesUserCompany] Final Match:', match);
+    return match;
+};
+
+const APPROVAL_CONFIG: Record<ApprovalType, {
+    label: string;
+    icon: React.ReactNode;
+    color: string;
+    hoverBorder: string;
+    badgeColor: string;
+    description: string;
+    emptyMsg: string;
+}> = {
+    RAB: {
+        label: 'Approval RAB',
+        icon: <FileText className="w-10 h-10" />,
+        color: 'text-blue-700',
+        hoverBorder: 'hover:border-blue-500',
+        badgeColor: 'bg-blue-100 text-blue-700 border-blue-200',
+        description: 'Rencana Anggaran Biaya yang menunggu persetujuan.',
+        emptyMsg: 'Tidak ada pengajuan RAB yang menunggu persetujuan.',
+    },
+    SPK: {
+        label: 'Approval SPK',
+        icon: <ClipboardList className="w-10 h-10" />,
+        color: 'text-purple-700',
+        hoverBorder: 'hover:border-purple-500',
+        badgeColor: 'bg-purple-100 text-purple-700 border-purple-200',
+        description: 'Surat Perintah Kerja yang menunggu penandatanganan.',
+        emptyMsg: 'Tidak ada pengajuan SPK yang menunggu persetujuan.',
+    },
+
+    PERTAMBAHAN_SPK: {
+        label: 'Approval Pertambahan SPK',
+        icon: <ClipboardList className="w-10 h-10" />,
+        color: 'text-emerald-700',
+        hoverBorder: 'hover:border-emerald-500',
+        badgeColor: 'bg-emerald-100 text-emerald-700 border-emerald-200',
+        description: 'Perpanjangan hari SPK yang menunggu persetujuan.',
+        emptyMsg: 'Tidak ada pengajuan pertambahan SPK yang menunggu persetujuan.',
+    },
+    OPNAME: {
+        label: 'Approval Kerja Tambah Kurang',
+        icon: <CheckCircle className="w-10 h-10" />,
+        color: 'text-sky-700',
+        hoverBorder: 'hover:border-sky-500',
+        badgeColor: 'bg-sky-100 text-sky-700 border-sky-200',
+        description: 'Kerja Tambah Kurang yang menunggu persetujuan.',
+        emptyMsg: 'Tidak ada pengajuan Kerja Tambah Kurang yang menunggu persetujuan.',
+    },
+
+    INSTRUKSI_LAPANGAN: {
+        label: 'Approval Instruksi Lapangan',
+        icon: <FileText className="w-10 h-10" />,
+        color: 'text-amber-700',
+        hoverBorder: 'hover:border-amber-500',
+        badgeColor: 'bg-amber-100 text-amber-700 border-amber-200',
+        description: 'Instruksi Lapangan yang menunggu persetujuan.',
+        emptyMsg: 'Tidak ada pengajuan Instruksi Lapangan yang menunggu persetujuan.',
+    },
+    PROJECT_PLANNING: {
+        label: 'Approval Project Planning',
+        icon: <ClipboardList className="w-10 h-10" />,
+        color: 'text-red-700',
+        hoverBorder: 'hover:border-red-500',
+        badgeColor: 'bg-red-100 text-red-700 border-red-200',
+        description: 'FPD Project Planning yang memerlukan review atau persetujuan.',
+        emptyMsg: 'Tidak ada project planning yang menunggu persetujuan.',
+    },
+    SURAT_PERINGATAN: {
+        label: 'Approval Surat Peringatan',
+        icon: <AlertTriangle className="w-10 h-10" />,
+        color: 'text-red-700',
+        hoverBorder: 'hover:border-red-500',
+        badgeColor: 'bg-red-100 text-red-700 border-red-200',
+        description: 'Surat Peringatan yang menunggu persetujuan manager.',
+        emptyMsg: 'Tidak ada Surat Peringatan yang menunggu persetujuan.',
+    },
+    INTERVENSI: {
+        label: 'Approval Intervensi',
+        icon: <AlertTriangle className="w-10 h-10" />,
+        color: 'text-red-700',
+        hoverBorder: 'hover:border-red-500',
+        badgeColor: 'bg-red-100 text-red-700 border-red-200',
+        description: 'Request intervensi dokumen yang menunggu persetujuan.',
+        emptyMsg: 'Tidak ada request intervensi yang menunggu persetujuan.',
+    },
+};
+
+const STATUS_BADGE_CLASS: Record<string, string> = {
+    // SP
+    WAITING_MANAGER:                    'bg-orange-100 text-orange-700 border-orange-200',
+    REJECTED_BY_MANAGER:                'bg-red-100 text-red-700 border-red-200',
+    SENT_TO_CONTRACTOR:                 'bg-blue-100 text-blue-700 border-blue-200',
+    VIEWED_BY_CONTRACTOR:               'bg-indigo-100 text-indigo-700 border-indigo-200',
+    ACKNOWLEDGED_BY_CONTRACTOR:         'bg-green-100 text-green-700 border-green-200',
+    'MENUNGGU GANTT CHART': 'bg-slate-100 text-slate-700 border-slate-200',
+    PENDING:             'bg-yellow-100 text-yellow-700 border-yellow-200',
+    PENDING_KOORDINATOR: 'bg-yellow-100 text-yellow-700 border-yellow-200',
+    PENDING_MANAGER:     'bg-orange-100 text-orange-700 border-orange-200',
+    PENDING_DIREKTUR:    'bg-red-100 text-red-700 border-red-200',
+    APPROVED:            'bg-green-100 text-green-700 border-green-200',
+    REJECTED:            'bg-red-100 text-red-700 border-red-200',
+    WAITING_FOR_BM_APPROVAL: 'bg-yellow-100 text-yellow-700 border-yellow-200',
+    SPK_APPROVED:            'bg-green-100 text-green-700 border-green-200',
+    SPK_REJECTED:            'bg-red-100 text-red-700 border-red-200',
+    'MENUNGGU PERSETUJUAN':  'bg-yellow-100 text-yellow-700 border-yellow-200',
+    'DISETUJUI BM':          'bg-green-100 text-green-700 border-green-200',
+    'DITOLAK BM':            'bg-red-100 text-red-700 border-red-200',
+    // Opname Final Specific
+    'PROSES KTK/APPROVAL KONTRAKTOR':   'bg-sky-100 text-sky-700 border-sky-200',
+    'MENUNGGU PERSETUJUAN KOORDINATOR': 'bg-yellow-100 text-yellow-700 border-yellow-200',
+    'MENUNGGU PERSETUJUAN MANAJER':     'bg-orange-100 text-orange-700 border-orange-200',
+    'MENUNGGU PERSETUJUAN DIREKTUR KONTRAKTOR': 'bg-red-100 text-red-700 border-red-200',
+    'MENUNGGU PERSETUJUAN DIREKTUR':    'bg-red-100 text-red-700 border-red-200',
+    'DISETUJUI':                        'bg-green-100 text-green-700 border-green-200',
+    'DITOLAK OLEH KOORDINATOR':         'bg-red-100 text-red-700 border-red-200',
+    'DITOLAK OLEH MANAJER':             'bg-red-100 text-red-700 border-red-200',
+    'DITOLAK OLEH DIREKTUR KONTRAKTOR': 'bg-red-100 text-red-700 border-red-200',
+    'DITOLAK OLEH DIREKTUR':            'bg-red-100 text-red-700 border-red-200',
+    // Project Planning
+    WAITING_BM_APPROVAL:                'bg-yellow-100 text-yellow-700 border-yellow-200',
+    WAITING_PP_APPROVAL_1:              'bg-yellow-100 text-yellow-700 border-yellow-200',
+    PP_DESIGN_3D_REQUIRED:              'bg-purple-100 text-purple-700 border-purple-200',
+    WAITING_RAB_UPLOAD:                 'bg-orange-100 text-orange-700 border-orange-200',
+    WAITING_BM_APPROVAL_2:              'bg-yellow-100 text-yellow-700 border-yellow-200',
+    WAITING_BM_REGIONAL_APPROVAL:       'bg-sky-100 text-sky-700 border-sky-200',
+    WAITING_SBCS_APPROVAL:              'bg-orange-100 text-orange-700 border-orange-200',
+    WAITING_REGIONAL_MANAGER_APPROVAL:  'bg-sky-100 text-sky-700 border-sky-200',
+    REVISION_REQUESTED:                 'bg-amber-100 text-amber-700 border-amber-200',
+    FINAL_REJECTED:                     'bg-red-100 text-red-700 border-red-200',
+    EXECUTED:                           'bg-green-100 text-green-700 border-green-200',
+    WAITING_PP_APPROVAL_2:              'bg-yellow-100 text-yellow-700 border-yellow-200',
+    WAITING_PP_MANAGER_APPROVAL:        'bg-yellow-100 text-yellow-700 border-yellow-200',
+    COMPLETED:                          'bg-green-100 text-green-700 border-green-200',
+    DRAFT:                              'bg-slate-100 text-slate-600 border-slate-200',
+};
+
+const STATUS_LABEL: Record<string, string> = {
+    // SP
+    WAITING_MANAGER:                    'PENDING (MGR.)',
+    REJECTED_BY_MANAGER:                'REJECTED (MGR.)',
+    SENT_TO_CONTRACTOR:                 'DIKIRIM',
+    VIEWED_BY_CONTRACTOR:               'DIBACA',
+    ACKNOWLEDGED_BY_CONTRACTOR:         'DISETUJUI',
+    'MENUNGGU GANTT CHART': 'MENUNGGU GANTT',
+    PENDING:             'PENDING',
+    PENDING_KOORDINATOR: 'PENDING (KOORD.)',
+    PENDING_MANAGER:     'PENDING (MGR.)',
+    PENDING_DIREKTUR:    'PENDING (DIR.)',
+    APPROVED:            'APPROVED',
+    REJECTED:            'REJECTED',
+    WAITING_FOR_BM_APPROVAL: 'PENDING BM',
+    SPK_APPROVED:            'APPROVED',
+    SPK_REJECTED:            'REJECTED',
+    'MENUNGGU PERSETUJUAN':  'PENDING BM',
+    'DISETUJUI BM':          'APPROVED',
+    'DITOLAK BM':            'REJECTED',
+    // Opname Final Specific
+    'MENUNGGU PERSETUJUAN KOORDINATOR': 'PENDING (KOORD.)',
+    'MENUNGGU PERSETUJUAN MANAJER':     'PENDING (MGR.)',
+    'MENUNGGU PERSETUJUAN DIREKTUR KONTRAKTOR': 'PENDING (DIR. KONTRAKTOR)',
+    'MENUNGGU PERSETUJUAN DIREKTUR':    'PENDING (DIR.)',
+    'DISETUJUI':                        'APPROVED',
+    'DITOLAK OLEH KOORDINATOR':         'REJECTED (KOORD.)',
+    'DITOLAK OLEH MANAJER':             'REJECTED (MGR.)',
+    'DITOLAK OLEH DIREKTUR KONTRAKTOR': 'REJECTED (DIR. KONTRAKTOR)',
+    'DITOLAK OLEH DIREKTUR':            'REJECTED (DIR.)',
+    // Instruksi Lapangan
+    // Project Planning
+    WAITING_BM_APPROVAL:                'Pending B&M Mgr',
+    WAITING_PP_APPROVAL_1:              'Pending PP (1)',
+    PP_DESIGN_3D_REQUIRED:              'Design 3D',
+    WAITING_RAB_UPLOAD:                 'Input Tahap 2',
+    WAITING_BM_APPROVAL_2:              'Pending B&M (2)',
+    WAITING_BM_REGIONAL_APPROVAL:       'Pending B&M Regional',
+    WAITING_SBCS_APPROVAL:              'Pending SBCS',
+    WAITING_REGIONAL_MANAGER_APPROVAL:  'Pending Regional',
+    REVISION_REQUESTED:                 'Revisi',
+    FINAL_REJECTED:                     'Ditolak Final',
+    EXECUTED:                           'Selesai',
+    WAITING_PP_APPROVAL_2:              'Pending PP (2)',
+    WAITING_PP_MANAGER_APPROVAL:        'Pending PP Mgr',
+    COMPLETED:                          'Selesai',
+    DRAFT:                              'Draft',
+};
+
+// =============================================
+// NORMALIZE HELPERS
+// =============================================
+const normalizeRABList = (items: RABListItem[]): NormalizedListItem[] =>
+    items.map(r => ({
+        id: r.id,
+        tipe: 'RAB' as ApprovalType,
+        nomor_ulok:    r.nomor_ulok ?? r.toko?.nomor_ulok ?? '-',
+        nama_toko:     r.nama_toko  ?? r.toko?.nama_toko  ?? '-',
+        cabang:        r.cabang     ?? r.toko?.cabang     ?? '-',
+        status:        r.status,
+        total_nilai:   parseCurrency(r.grand_total_final ?? r.grand_total),
+        email_pembuat: r.email_pembuat,
+        created_at:    r.created_at,
+        _raw: r,
+    }));
+
+const normalizeSPKList = (items: SPKListItem[]): NormalizedListItem[] =>
+    items.map(s => {
+        const raw = s as any; // Bypass TS strict jika tipe di api.ts belum diperbarui
+        return {
+            id: raw.id,
+            id_toko: raw.toko?.id ?? raw.id_toko,
+            tipe: 'SPK' as ApprovalType,
+            nomor_ulok:    raw.nomor_ulok,
+            nama_toko:     raw.toko?.nama_toko ?? raw.nama_toko ?? '-',
+            cabang:        raw.toko?.cabang ?? raw.cabang ?? '-',
+            status:        raw.status,
+            total_nilai:   parseCurrency(raw.grand_total),
+            email_pembuat: raw.email_pembuat,
+            created_at:    raw.created_at,
+            _raw: raw,
+        };
+    });
+
+
+
+const normalizePertambahanSPKList = (items: PertambahanSPKListItem[]): NormalizedListItem[] =>
+    items.map(p => ({
+        id: p.id,
+        tipe: 'PERTAMBAHAN_SPK' as ApprovalType,
+        nomor_ulok:    p.toko?.nomor_ulok || p.spk?.nomor_ulok || p.nomor_spk || '-',
+        nama_toko:     p.toko?.nama_toko || `Perpanjangan ${p.pertambahan_hari} Hari`,
+        cabang:        p.toko?.cabang || '',
+        status:        p.status_persetujuan,
+        total_nilai:   0,
+        email_pembuat: p.dibuat_oleh,
+        created_at:    p.created_at,
+        pertambahan_hari: p.pertambahan_hari,
+        nomor_spk:     p.nomor_spk,
+        alasan_perpanjangan: p.alasan_perpanjangan,
+        _raw: p,
+    }));
+
+const normalizeOpnameList = (items: any[]): NormalizedListItem[] =>
+    items.map(o => ({
+        id: o.id,
+        tipe: 'OPNAME' as ApprovalType,
+        nomor_ulok:    o.nomor_ulok || o.toko?.nomor_ulok || '-',
+        nama_toko:     o.nama_toko  || o.toko?.nama_toko  || '-',
+        cabang:        o.cabang     || o.toko?.cabang     || '-',
+        status:        o.status_opname_final,
+        total_nilai:   parseCurrency(o.grand_total_final ?? o.grand_total_opname),
+        email_pembuat: o.email_pembuat,
+        created_at:    o.created_at,
+        hari_denda:    Number(o.hari_denda ?? 0),
+        nilai_denda:   o.nilai_denda,
+        _raw: o,
+    }));
+
+
+
+const normalizeInstruksiLapanganList = (items: any[]): NormalizedListItem[] =>
+    items.map(i => ({
+        id: i.id,
+        tipe: 'INSTRUKSI_LAPANGAN' as ApprovalType,
+        nomor_ulok:    i.nomor_ulok ?? '-',
+        nama_toko:     i.nama_toko ?? '-',
+        cabang:        i.cabang ?? '-',
+        status:        i.status,
+        total_nilai:   parseCurrency(i.grand_total_final ?? i.grand_total),
+        email_pembuat: i.email_pembuat,
+        created_at:    i.created_at,
+        _raw: i,
+    }));
+
+const normalizeProjekPlanningList = (items: ProjekPlanningItem[]): NormalizedListItem[] =>
+    items.map(p => ({
+        id: p.id,
+        tipe: 'PROJECT_PLANNING' as ApprovalType,
+        nomor_ulok:    p.nomor_ulok ?? '-',
+        nama_toko:     (p as any).toko?.nama_toko || p.nama_toko || p.nama_lokasi || '-',
+        cabang:        p.cabang || '-',
+        status:        p.status,
+        total_nilai:   parseCurrency(p.estimasi_biaya ?? '0'),
+        email_pembuat: p.email_pembuat,
+        created_at:    p.created_at,
+        _raw: p,
+    }));
+
+const normalizeIntervensiList = (items: RequestIntervensi[]): NormalizedListItem[] =>
+    items.map(r => ({
+        id: r.id,
+        id_toko: r.id_toko ?? undefined,
+        tipe: 'INTERVENSI' as ApprovalType,
+        nomor_ulok: r.nomor_ulok || '-',
+        nama_toko: r.nama_toko || REQUEST_INTERVENSI_LABELS[r.jenis_intervensi] || 'Request Intervensi',
+        cabang: r.cabang || '-',
+        status: r.status_request,
+        total_nilai: 0,
+        email_pembuat: r.submitted_by,
+        created_at: r.created_at,
+        _raw: r,
+    }));
+
+// =============================================
+// SUB-COMPONENTS
+// =============================================
+const ApprovalBadge = ({ status }: { status: string }) => {
+    const upper = (status ?? '').toUpperCase();
+    return (
+        <Badge className={`${STATUS_BADGE_CLASS[upper] ?? 'bg-slate-100 text-slate-600 border-slate-200'} font-medium text-xs px-2 py-0.5 border`}>
+            {STATUS_LABEL[upper] ?? status}
+        </Badge>
+    );
+};
+
+const ApprovalHistoryRow = ({ label, pemberi, waktu, catatan }: {
+    label: string; pemberi?: string | null; waktu?: string | null; catatan?: string | null;
+}) => {
+    if (!pemberi) return null;
+    return (
+        <div className="flex flex-col gap-1">
+            <div className="flex items-center gap-3 text-sm">
+                <CheckCircle className="w-4 h-4 text-green-500 shrink-0" />
+                <span className="text-slate-600 font-medium w-28">{label}</span>
+                <span className="text-slate-800 font-semibold">{pemberi}</span>
+                {waktu && <span className="text-slate-400 text-xs ml-1">{formatDate(waktu)}</span>}
+            </div>
+            {catatan && (
+                <div className="ml-[140px]">
+                    <p className="text-xs text-slate-500 italic break-words">"{catatan}"</p>
+                </div>
+            )}
+        </div>
+    );
+};
+
+// =============================================
+// MAIN PAGE COMPONENT
+// =============================================
+function ApprovalPageContent() {
+    const router = useRouter();
+    const searchParams = useSearchParams();
+
+    // --- AUTH ---
+    const [userInfo, setUserInfo]       = useState({ name: '', role: '', cabang: '', email: '', nama_pt: '' });
+    const [accessibleTypes, setAccessibleTypes] = useState<ApprovalType[]>([]);
+    const [jabatan, setJabatan]         = useState<ApprovalJabatan | null>(null);
+
+    // --- NAVIGATION ---
+    const [activeView, setActiveView]     = useState<ActiveView>('menu');
+    const [selectedType, setSelectedType] = useState<ApprovalType | null>(null);
+    const [autoSelectedType, setAutoSelectedType] = useState<ApprovalType | null>(null);
+    const [autoOpenDetailId, setAutoOpenDetailId] = useState<string | null>(null);
+    const [autoOpenedDetailKey, setAutoOpenedDetailKey] = useState<string | null>(null);
+
+    // --- DATA ---
+    const [listData, setListData]         = useState<NormalizedListItem[]>([]);
+    const [selectedDetail, setSelectedDetail] = useState<NormalizedDetail | null>(null);
+    const [approvalCounts, setApprovalCounts] = useState<ApprovalCounts>(EMPTY_APPROVAL_COUNTS);
+    const [isCountsLoading, setIsCountsLoading] = useState(false);
+    const [searchQuery, setSearchQuery]   = useState('');
+    const [cabangFilter, setCabangFilter] = useState('');
+    const [hydratedBranchCoverage, setHydratedBranchCoverage] = useState<string[]>([]);
+
+    // --- UI ---
+    const [isLoading, setIsLoading]           = useState(false);
+    const [isDetailLoading, setIsDetailLoading] = useState(false);
+    const [processingId, setProcessingId]     = useState<number | string | null>(null);
+    const [rejectModal, setRejectModal]       = useState<NormalizedListItem | NormalizedDetail | null>(null);
+    const [rejectNote, setRejectNote]         = useState('');
+    const [rejectDisposition, setRejectDisposition] = useState<'REVISION' | 'FINAL'>('REVISION');
+    const [rejectRabRevisionItems, setRejectRabRevisionItems] = useState<Array<{ id: number | null; note: string }>>([]);
+    const [approveModal, setApproveModal]     = useState<NormalizedListItem | NormalizedDetail | null>(null);
+    const [approveNote, setApproveNote]       = useState('');
+    const [rabCoordinatorInfo, setRabCoordinatorInfo] = useState(EMPTY_RAB_COORDINATOR_INFO);
+    const [approveModalError, setApproveModalError] = useState('');
+    const [approveSuccessModal, setApproveSuccessModal] = useState<{ title: string; desc: string } | null>(null);
+    const [rejectSuccessModal, setRejectSuccessModal] = useState<{ title: string; desc: string } | null>(null);
+    const [toast, setToast]                   = useState<{ msg: string; type: 'success' | 'error' } | null>(null);
+
+    // ==========================================
+    // AUTH INIT
+    // ==========================================
+    const { user } = useSession();
+
+    useEffect(() => {
+        if (!user) return;
+
+        const { role, email, cabang, namaLengkap, namaPt: nama_pt } = user;
+
+        // Handle Multi-Role
+        const roles = role.split(',').map(r => r.trim().toUpperCase());
+        
+        const isHO = cabang?.toUpperCase() === 'HEAD OFFICE';
+        const isDirectorHO = isHeadOfficeDirector(cabang, roles);
+        const isSuperHuman = user.isSuperHuman ?? false;
+        const isProjectPlanningApprovalRole = roles.some(r =>
+            r.includes('BUILDING & MAINTENANCE REGIONAL MANAGER') ||
+            r.includes('B&M REGIONAL') ||
+            r.includes('REGIONAL MANAGER') ||
+            r.includes('PROJECT PLANNING & DEVELOPMENT SPECIALIST') ||
+            r.includes('PROJECT PLANNING & DEVELOPMENT MANAGER') ||
+            r.includes('PP SPECIALIST') ||
+            r.includes('PP MANAGER')
+        );
+
+        // Find all accessible types across all roles
+        // EXCLUDE pure "KONTRAKTOR" role (without DIREKTUR prefix) karena approval bukan untuk kontraktor murni
+        const approvalRoles = roles.filter(r => {
+            const normalized = r.trim().toUpperCase();
+            // Exclude "KONTRAKTOR" murni, tapi allow "DIREKTUR KONTRAKTOR"
+            if (normalized === 'KONTRAKTOR') return false;
+            return true;
+        });
+
+        const allAccessibleTypes = new Set<ApprovalType>();
+        if (isSuperHuman) {
+            allAccessibleTypes.add('RAB');
+            allAccessibleTypes.add('SPK');
+            allAccessibleTypes.add('PERTAMBAHAN_SPK');
+            allAccessibleTypes.add('OPNAME');
+            allAccessibleTypes.add('INSTRUKSI_LAPANGAN');
+            allAccessibleTypes.add('PROJECT_PLANNING');
+            allAccessibleTypes.add('SURAT_PERINGATAN');
+            allAccessibleTypes.add('INTERVENSI');
+        } else if (isProjectPlanningApprovalRole && isHO) {
+            allAccessibleTypes.add('PROJECT_PLANNING');
+        } else if (isDirectorHO) {
+            allAccessibleTypes.add('RAB');
+            if (approvalRoles.some(r => r === 'DIREKTUR KONTRAKTOR')) {
+                allAccessibleTypes.add('OPNAME');
+            }
+        } else {
+            approvalRoles.forEach(r => {
+                (Object.keys(ROLE_ACCESS) as ApprovalType[]).forEach(type => {
+                    if (ROLE_ACCESS[type].some(allowedRole => allowedRole.toUpperCase() === r)) {
+                        allAccessibleTypes.add(type);
+                    }
+                });
+                if (
+                    r.includes('BRANCH BUILDING & MAINTENANCE MANAGER') ||
+                    r.includes('B&M MANAGER') ||
+                    r.includes('STORE & BRANCH CONTROLLING') ||
+                    r.includes('BUILDING & MAINTENANCE REGIONAL MANAGER') ||
+                    r.includes('B&M REGIONAL') ||
+                    r.includes('REGIONAL MANAGER')
+                ) {
+                    allAccessibleTypes.add('INTERVENSI');
+                }
+            });
+        }
+        if (isHO && approvalRoles.some(r => ROLE_ACCESS.PROJECT_PLANNING.some(allowedRole => allowedRole.toUpperCase() === r))) {
+            allAccessibleTypes.add('PROJECT_PLANNING');
+        }
+
+        const typesArr = Array.from(allAccessibleTypes);
+
+        if (typesArr.length === 0) {
+            alert("Role tidak memiliki akses ke halaman Approval.");
+            router.push('/dashboard');
+            return;
+        }
+
+        // Prioritas Jabatan: DIREKTUR KONTRAKTOR > DIREKTUR > MANAGER > KOORDINATOR
+        // Super Human mendapat jabatan MANAGER untuk bisa approve semua level
+        let currentJabatan: ApprovalJabatan | null = null;
+        if (isSuperHuman) {
+            currentJabatan = 'MANAGER';
+        } else if (roles.some(r => r === 'DIREKTUR KONTRAKTOR')) {
+            currentJabatan = 'DIREKTUR_KONTRAKTOR';
+        } else if (roles.some(r => r.includes('DIREKTUR'))) {
+            currentJabatan = 'DIREKTUR';
+        } else if (roles.includes('BRANCH BUILDING & MAINTENANCE MANAGER') || roles.includes('MANAGER')) {
+            currentJabatan = 'MANAGER';
+        } else if (roles.includes('BRANCH BUILDING COORDINATOR') || roles.includes('COORDINATOR')) {
+            currentJabatan = 'KOORDINATOR';
+        }
+
+        setUserInfo({ 
+            name: namaLengkap.toUpperCase(), 
+            role, 
+            cabang, 
+            email, 
+            nama_pt: nama_pt || '' // Ensure empty string instead of undefined/null
+        });
+        
+        console.log('[Approval Page] User Info:', { 
+            role, 
+            cabang, 
+            nama_pt: nama_pt || '(empty)', 
+            jabatan: currentJabatan,
+            accessibleTypes: typesArr 
+        });
+        setAccessibleTypes(typesArr);
+        setJabatan(currentJabatan);
+    }, [user, router]);
+
+    // ==========================================
+    // SESSION STORAGE ANTI-REFRESH
+    // ==========================================
+    useEffect(() => {
+        if (activeView === 'menu') {
+            sessionStorage.removeItem('approval_lastView');
+            sessionStorage.removeItem('approval_selectedType');
+        } else {
+            sessionStorage.setItem('approval_lastView', activeView);
+            if (selectedType) sessionStorage.setItem('approval_selectedType', selectedType);
+        }
+    }, [activeView, selectedType]);
+
+    // ==========================================
+    // TOAST
+    // ==========================================
+    const showToast = (msg: string, type: 'success' | 'error') => {
+        setToast({ msg, type });
+        setTimeout(() => setToast(null), 3500);
+    };
+
+    /**
+     * Fetch user's effective branch coverage from backend.
+     * CRITICAL: Always fetch fresh data from backend to avoid stale sessionStorage.
+     * This fixes bug where FIRMAN SOLEH sees CIKOKOL instead of BALARAJA/SERANG.
+     */
+    const ensureBranchCoverage = useCallback(async (roles: string[], cabang: string, email: string): Promise<string[]> => {
+        if (!email || !cabang) {
+            const fallback = [cabang.toUpperCase()].filter(Boolean);
+            setHydratedBranchCoverage(fallback);
+            return fallback;
+        }
+
+        try {
+            // ALWAYS fetch from backend - no stale cache
+            console.log('[ensureBranchCoverage] Fetching fresh coverage from backend...', { email, cabang, roles });
+            
+            const token = sessionStorage.getItem('spartaAccessToken'); // FIX: Use correct token key
+            if (!token) {
+                console.warn('[ensureBranchCoverage] No access token found');
+                const fallback = [cabang.toUpperCase()];
+                setHydratedBranchCoverage(fallback);
+                return fallback;
+            }
+
+            const response = await fetch(`${API_URL}/api/user-cabang/my-coverage`, {
+                headers: {
+                    'Authorization': `Bearer ${token}`,
+                    'Content-Type': 'application/json'
+                }
+            });
+
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+            }
+
+            const result = await response.json();
+            const coverage = Array.isArray(result.data?.branches)
+                ? result.data.branches.map((branch: unknown) => String(branch).trim().toUpperCase()).filter(Boolean)
+                : [];
+
+            console.log('[ensureBranchCoverage] Fresh coverage fetched:', { 
+                coverage, 
+                source: result.data?.source,
+                count: coverage.length 
+            });
+
+            if (coverage.length > 0) {
+                sessionStorage.setItem("branchCoverage", JSON.stringify(coverage));
+                setHydratedBranchCoverage(coverage);
+                return coverage;
+            }
+
+            // Fallback: cabang login
+            const fallback = [cabang.toUpperCase()];
+            sessionStorage.setItem("branchCoverage", JSON.stringify(fallback));
+            setHydratedBranchCoverage(fallback);
+            return fallback;
+        } catch (error) {
+            console.error("[ensureBranchCoverage] Failed to fetch coverage:", error);
+            // Fallback to cabang login on error
+            const fallback = [cabang.toUpperCase()];
+            setHydratedBranchCoverage(fallback);
+            return fallback;
+        }
+    }, []);
+
+    const refreshApprovalCounts = useCallback(async () => {
+        if (!user) return;
+        setIsCountsLoading(true);
+        try {
+            const roles = (user.roles && user.roles.length > 0 ? user.roles : userInfo.role.split(','))
+                .map(role => String(role).trim().toUpperCase())
+                .filter(Boolean);
+            const canSeeEverything = canApproveAllBranches(roles.join(','), user.isSuperHuman ?? false);
+            if (!canSeeEverything) {
+                await ensureBranchCoverage(roles, userInfo.cabang, userInfo.email);
+            }
+            const counts = await fetchApprovalNotificationCounts(user);
+            setApprovalCounts(counts);
+        } catch {
+            setApprovalCounts(EMPTY_APPROVAL_COUNTS);
+        } finally {
+            setIsCountsLoading(false);
+        }
+    }, [ensureBranchCoverage, user, userInfo.cabang, userInfo.email, userInfo.role]);
+
+    useEffect(() => {
+        refreshApprovalCounts();
+    }, [refreshApprovalCounts]);
+
+    // ==========================================
+    // LOAD LIST
+    // ==========================================
+    const loadList = async (type: ApprovalType): Promise<NormalizedListItem[]> => {
+        setIsLoading(true);
+        setSearchQuery('');
+        try {
+            const sessionRoles = userInfo.role
+                .split(',')
+                .map(r => r.trim().toUpperCase())
+                .filter(Boolean);
+            const sessionIsSuperHuman = user?.isSuperHuman ?? false;
+            const sessionCanSeeAllBranches = canApproveAllBranches(userInfo.role, sessionIsSuperHuman);
+            const currentCoverage = sessionCanSeeAllBranches
+                ? []
+                : await ensureBranchCoverage(sessionRoles, userInfo.cabang, userInfo.email);
+
+            let normalized: NormalizedListItem[] = [];
+            if (type === 'RAB') {
+                // Approval must not rely on nama_pt at API level because older RAB data can
+                // contain the wrong contractor name and would disappear before role filtering.
+                const res = await fetchRABList();
+                normalized = normalizeRABList(res.data ?? []);
+            } else if (type === 'SPK') {
+                const res = await fetchSPKList({ status: 'WAITING_FOR_BM_APPROVAL' });
+                normalized = normalizeSPKList(res.data ?? []);
+            } else if (type === 'PERTAMBAHAN_SPK') {
+                const res = await fetchPertambahanSPKList({ status_persetujuan: 'Menunggu Persetujuan' });
+                normalized = normalizePertambahanSPKList(res.data ?? []);
+            } else if (type === 'OPNAME') {
+                // Fetch OPNAME with pending approval statuses only
+                const pendingStatuses = jabatan === 'KOORDINATOR'
+                    ? 'Menunggu Persetujuan Koordinator'
+                    : jabatan === 'MANAGER'
+                        ? 'Menunggu Persetujuan Manajer'
+                        : jabatan === 'DIREKTUR_KONTRAKTOR'
+                            ? 'Menunggu Persetujuan Direktur Kontraktor'
+                            : jabatan === 'DIREKTUR'
+                            ? 'Menunggu Persetujuan Direktur'
+                            : null;
+                
+                console.log('[OPNAME List] Fetching with:', {
+                    jabatan,
+                    targetStatus: pendingStatuses,
+                    userEmail: userInfo.email,
+                    userCompany: userInfo.nama_pt,
+                    branchCoverage: hydratedBranchCoverage.length
+                });
+                
+                const res = await fetchOpnameFinalList({
+                    aksi: 'terkunci',
+                    tipe_opname: 'OPNAME_FINAL',
+                    ...(pendingStatuses ? { status: pendingStatuses } : {}),
+                    ...(hydratedBranchCoverage.length > 0 ? { cabang_array: hydratedBranchCoverage } : {})
+                });
+                
+                const opnameListRaw = Array.isArray(res.data)
+                    ? res.data
+                    : Array.isArray((res.data as any)?.opname_final)
+                        ? (res.data as any).opname_final
+                        : [];
+                
+                console.log('[OPNAME List] Raw items from API:', opnameListRaw.length);
+                
+                normalized = normalizeOpnameList(opnameListRaw);
+                
+                console.log('[OPNAME List] After normalization:', normalized.length);
+                
+                // Client-side company filter untuk direktur kontraktor (security berlapis)
+                const isContraktorRole = userInfo.role.split(',').some((r: string) => 
+                    r.trim().toUpperCase().includes('KONTRAKTOR') || 
+                    r.trim().toUpperCase().includes('DIREKTUR')
+                );
+                
+                if (isContraktorRole && userInfo.nama_pt) {
+                    const beforeFilter = normalized.length;
+                    normalized = normalized.filter(item => {
+                        const match = matchesUserCompany(item._raw, userInfo.nama_pt);
+                        if (!match) {
+                            console.log('[OPNAME Filter] Excluded:', {
+                                ulok: item.nomor_ulok,
+                                tokoCompany: (item._raw as any)?.nama_kontraktor,
+                                userCompany: userInfo.nama_pt
+                            });
+                        }
+                        return match;
+                    });
+                    console.log('[OPNAME List] After company filter:', {
+                        beforeFilter,
+                        afterFilter: normalized.length,
+                        userCompany: userInfo.nama_pt,
+                        filtered: beforeFilter - normalized.length
+                    });
+                }
+            } else if (type === 'INSTRUKSI_LAPANGAN') {
+                const res = await fetchInstruksiLapanganList();
+                normalized = normalizeInstruksiLapanganList(res.data ?? []);
+            } else if (type === 'PROJECT_PLANNING') {
+                const res = await fetchProjekPlanningList();
+                normalized = normalizeProjekPlanningList(res.data ?? []);
+            } else if (type === 'SURAT_PERINGATAN') {
+                const res = await fetchDendaActions({ action_type: 'SP' });
+                normalized = (res.data ?? [])
+                    .filter((action: DendaAction) => action.status === 'WAITING_MANAGER')
+                    .map((action: DendaAction) => ({
+                        id: action.id,
+                        tipe: 'SURAT_PERINGATAN' as ApprovalType,
+                        nomor_ulok: action.nomor_ulok || '-',
+                        nama_toko: action.nama_toko || '-',
+                        cabang: action.cabang || '-',
+                        status: action.status,
+                        total_nilai: Number(action.nilai_denda || 0),
+                        email_pembuat: action.submitted_by_email || '-',
+                        created_at: action.created_at,
+                        _raw: action,
+                    }));
+            } else if (type === 'INTERVENSI') {
+                const res = await fetchRequestIntervensiList();
+                normalized = normalizeIntervensiList(res.data ?? []);
+            }
+
+            // Filter Berdasarkan Role & Jabatan & Cabang
+            normalized = normalized.filter(item => {
+                const upper = (item.status ?? '').toUpperCase();
+                const upperUserCabang = normalizeBranch(userInfo.cabang);
+                const userRoles = userInfo.role
+                    .split(',')
+                    .map(r => r.trim().toUpperCase())
+                    .filter(Boolean);
+                const isHOUser = upperUserCabang === 'HEAD OFFICE';
+                const isSuperHumanUser = user?.isSuperHuman ?? false;
+                const canApproveAll = canApproveAllBranches(userRoles, isSuperHumanUser);
+                const branchAllowed = !item.cabang || item.cabang === '-'
+                    || canAccessBranchForUser(item.cabang, userRoles, upperUserCabang, currentCoverage);
+
+                if (type === 'PROJECT_PLANNING') {
+                    if (isSuperHumanUser) return true;
+
+                    const isBmManager = userRoles.some(r =>
+                        r.includes('BRANCH BUILDING & MAINTENANCE MANAGER') ||
+                        r.includes('MAINTENANCE MANAGER') ||
+                        r.includes('BBMM')
+                    );
+                    const isBmRegionalManager = userRoles.some(r =>
+                        r.includes('BUILDING & MAINTENANCE REGIONAL MANAGER') ||
+                        r.includes('B&M REGIONAL') ||
+                        r.includes('REGIONAL MANAGER')
+                    );
+                    const isPpSpecialist = userRoles.some(r =>
+                        r.includes('PROJECT PLANNING & DEVELOPMENT SPECIALIST') ||
+                        r.includes('PP SPECIALIST')
+                    );
+                    const isPpManager = userRoles.some(r =>
+                        r.includes('PROJECT PLANNING & DEVELOPMENT MANAGER') ||
+                        r.includes('PP MANAGER')
+                    );
+
+                    const statusMatchesRole =
+                        (isBmManager && (upper === 'WAITING_BM_APPROVAL' || upper === 'WAITING_BM_APPROVAL_2')) ||
+                        (isBmRegionalManager && upper === 'WAITING_BM_REGIONAL_APPROVAL') ||
+                        (isPpSpecialist && ['WAITING_PP_APPROVAL_1', 'PP_DESIGN_3D_REQUIRED', 'WAITING_PP_APPROVAL_2'].includes(upper)) ||
+                        (isPpManager && upper === 'WAITING_PP_MANAGER_APPROVAL');
+
+                    if (!statusMatchesRole) return false;
+                    return branchAllowed;
+                }
+
+                if (type === 'INTERVENSI') {
+                    if (!branchAllowed && !canApproveAll) return false;
+
+                    const isBmManager = userRoles.some(r =>
+                        r.includes('BRANCH BUILDING & MAINTENANCE MANAGER') ||
+                        r.includes('B&M MANAGER') ||
+                        r === 'MANAGER'
+                    );
+                    const isSbcs = userRoles.some(r => r.includes('STORE & BRANCH CONTROLLING'));
+                    const isRegionalManager = userRoles.some(r =>
+                        r.includes('BUILDING & MAINTENANCE REGIONAL MANAGER') ||
+                        r.includes('B&M REGIONAL') ||
+                        r.includes('REGIONAL MANAGER')
+                    );
+
+                    if (isSuperHumanUser) {
+                        return ['WAITING_BM_APPROVAL', 'WAITING_SBCS_APPROVAL', 'WAITING_REGIONAL_MANAGER_APPROVAL'].includes(upper);
+                    }
+
+                    return (isBmManager && upper === 'WAITING_BM_APPROVAL')
+                        || (isSbcs && upper === 'WAITING_SBCS_APPROVAL')
+                        || (isRegionalManager && upper === 'WAITING_REGIONAL_MANAGER_APPROVAL');
+                }
+
+                if (!canApproveAll && jabatan !== 'DIREKTUR' && jabatan !== 'DIREKTUR_KONTRAKTOR' && !branchAllowed) {
+                    return false;
+                }
+                
+                // 2. FILTER STATUS (Harus pending/menunggu)
+                if (!isPendingApprovalStatus(upper)) return false;
+                
+                // 3. FILTER JABATAN & STATUS MATCH
+                // Khusus SPK, pastikan statusnya valid menunggu BM
+                if (type === 'SPK') {
+                    return upper === 'WAITING_FOR_BM_APPROVAL';
+                }
+
+                // Pertambahan SPK — hanya yang Menunggu Persetujuan
+                if (type === 'PERTAMBAHAN_SPK') {
+                    return upper === 'MENUNGGU PERSETUJUAN';
+                }
+
+                // RAB: Stage check untuk semua level (Koordinator, Manager, Direktur Kontraktor)
+                // Company scope TIDAK di-check di FE karena data legacy
+                if (type === 'RAB') {
+                    // REMOVED: Frontend branch filtering - backend already handles this
+                    // if (upperUserCabang && !isDirectorHOUser && item.cabang && item.cabang !== '-') {
+                    //     if (!canAccessBranchForUser(item.cabang, userRoles, upperUserCabang, userBranchCoverage)) return false;
+                    // }
+
+                    return matchesApprovalStage(jabatan, upper);
+                }
+
+                // OPNAME: Stage check first, then company scope untuk role kontraktor
+                if (type === 'OPNAME') {
+                    // Stage check dulu
+                    const stageMatches = matchesApprovalStage(jabatan, upper, type, upperUserCabang);
+                    console.log('[OPNAME Filter] Item:', {
+                        id: item.id,
+                        status: item.status,
+                        jabatan,
+                        stageMatches,
+                        isContractorRole: isContractorCompanyScopedRole(userRoles),
+                        userNamaPt: userInfo.nama_pt,
+                        hasRaw: !!item._raw,
+                        rawKeys: item._raw ? Object.keys(item._raw).slice(0, 30) : []
+                    });
+                    
+                    if (!stageMatches) {
+                        console.log('[OPNAME Filter] REJECTED - Stage mismatch');
+                        return false;
+                    }
+                    
+                    // Company scope HANYA untuk role kontraktor (termasuk DIREKTUR KONTRAKTOR)
+                    if (isContractorCompanyScopedRole(userRoles)) {
+                        // Jika user punya nama_pt, harus cocok. Jika tidak punya, loloskan (super human fallback)
+                        if (userInfo.nama_pt) {
+                            console.log('[OPNAME Filter] Calling matchesUserCompany with:', {
+                                userNamaPt: userInfo.nama_pt,
+                                rawDataPassed: item._raw
+                            });
+                            
+                            if (!matchesUserCompany(item._raw, userInfo.nama_pt)) {
+                                console.log('[OPNAME Filter] REJECTED - Company mismatch');
+                                return false;
+                            }
+                        }
+                    }
+                    
+                    console.log('[OPNAME Filter] ACCEPTED');
+                    return true;
+                }
+
+                // Untuk IL dan tipe lainnya (Multi-level)
+                return matchesApprovalStage(jabatan, upper, type, upperUserCabang);
+            });
+
+            setListData(normalized);
+            refreshApprovalCounts();
+            return normalized;
+        } catch (err: any) {
+            showToast(err.message || 'Gagal memuat data.', 'error');
+            setListData([]);
+            return [];
+        } finally {
+            setIsLoading(false);
+        }
+    };
+
+    // ==========================================
+    // LOAD DETAIL
+    // ==========================================
+    const loadDetail = async (item: NormalizedListItem) => {
+        if (item.tipe === 'PROJECT_PLANNING') {
+            router.push(`/projek-planning/${item.id}?from=approval`);
+            return;
+        }
+
+        setIsDetailLoading(true);
+        setActiveView('detail');
+        try {
+            let detail: NormalizedDetail | null = null;
+
+            if (item.tipe === 'INTERVENSI') {
+                const res = await fetchRequestIntervensiDetail(item.id);
+                const r = res.data.request;
+                detail = {
+                    id: r.id,
+                    tipe: 'INTERVENSI',
+                    nomor_ulok: r.nomor_ulok || '-',
+                    id_toko: r.id_toko ?? undefined,
+                    nama_toko: r.nama_toko || REQUEST_INTERVENSI_LABELS[r.jenis_intervensi] || '-',
+                    cabang: r.cabang || '-',
+                    lingkup_pekerjaan: r.lingkup_pekerjaan || undefined,
+                    status: r.status_request,
+                    total_nilai: 0,
+                    email_pembuat: r.submitted_by,
+                    created_at: r.created_at,
+                    alasan_penolakan: r.rejection_reason,
+                    link_pdf_gabungan: r.link_pdf_ba,
+                    link_lampiran_pendukung: r.link_lampiran,
+                    items: [],
+                    _raw: { ...r, logs: res.data.logs },
+                };
+            } else if (item.tipe === 'RAB') {
+                const res = await fetchRABDetail(item.id);
+                const d = res.data;
+                detail = {
+                    id: d.rab.id,
+                    tipe: 'RAB',
+                    nomor_ulok:        d.toko.nomor_ulok,
+                    id_toko:           d.toko.id,
+                    nama_toko:         d.toko.nama_toko,
+                    alamat:            d.toko.alamat,
+                    cabang:            d.toko.cabang,
+                    lingkup_pekerjaan: d.toko.lingkup_pekerjaan,
+                    nama_kontraktor:   d.toko.nama_kontraktor,
+                    status:            d.rab.status,
+                    total_nilai:       parseCurrency(d.rab.grand_total_final ?? d.rab.grand_total),
+                    email_pembuat:     d.rab.email_pembuat,
+                    created_at:        d.rab.created_at,
+                    alasan_penolakan:  d.rab.alasan_penolakan,
+                    link_pdf_gabungan: d.rab.link_pdf_gabungan,
+                    approval_koordinator: { pemberi: d.rab.pemberi_persetujuan_koordinator, waktu: d.rab.waktu_persetujuan_koordinator, catatan: d.rab.catatan_persetujuan_koordinator },
+                    approval_manager:     { pemberi: d.rab.pemberi_persetujuan_manager,     waktu: d.rab.waktu_persetujuan_manager, catatan: d.rab.catatan_persetujuan_manager },
+                    approval_direktur:    { pemberi: d.rab.pemberi_persetujuan_direktur,    waktu: d.rab.waktu_persetujuan_direktur, catatan: d.rab.catatan_persetujuan_direktur },
+                    durasi:               d.rab.durasi_pekerjaan ? Number(d.rab.durasi_pekerjaan) : undefined,
+                    // Coordinator info (beanspot, HTH, fasade) - hanya untuk manager
+                    beanspot_type: d.rab.beanspot_type,
+                    is_hth: d.rab.is_hth,
+                    hth_meter: d.rab.hth_meter,
+                    is_fasade: d.rab.is_fasade,
+                    items: (d.items ?? []).map((it: RABDetailItem) => {
+                        console.log("RAB ITEM:", it);
+                        return {
+                            id: it.id,
+                            kategori:        it.kategori_pekerjaan,
+                            jenis_pekerjaan: it.jenis_pekerjaan,
+                            satuan:          it.satuan,
+                            volume:          it.volume,
+                            harga_material:  it.harga_material,
+                            harga_upah:      it.harga_upah,
+                            total:           it.total_harga,
+                            catatan:         it.catatan,
+                        };
+                    }),
+                };
+
+            } else if (item.tipe === 'SPK') {
+            const res = await fetchSPKDetail(item.id);
+            const d = res.data;
+            const stTarget = buildStTargetDisplay((d.pengajuan as any).effective_waktu_selesai || (d.pengajuan as any).waktu_selesai);
+            detail = {
+                id: d.pengajuan.id,
+                tipe: 'SPK',
+                nomor_ulok:        d.pengajuan.nomor_ulok,
+                id_toko:           (d.pengajuan as any).toko?.id ?? (d.pengajuan as any).id_toko,
+                nama_toko:         item.nama_toko,
+                kode_toko:         (d.pengajuan as any).toko?.kode_toko ?? (d.pengajuan as any).kode_toko,
+                cabang:            item.cabang,
+                lingkup_pekerjaan: (d.pengajuan as any).lingkup_pekerjaan ?? '-',
+                status:            d.pengajuan.status,
+                total_nilai:       parseCurrency((d.pengajuan as any).grand_total),
+                email_pembuat:     (d.pengajuan as any).email_pembuat,
+                created_at:        (d.pengajuan as any).created_at,
+                alasan_penolakan:  (d.pengajuan as any).alasan_penolakan,
+                nama_kontraktor:   (d.pengajuan as any).nama_kontraktor,
+                durasi:            (d.pengajuan as any).durasi,
+                waktu_mulai:       (d.pengajuan as any).waktu_mulai,
+                waktu_selesai:     (d.pengajuan as any).waktu_selesai,
+                ...stTarget,
+                nilai_kontrak:     parseCurrency((d.pengajuan as any).grand_total),
+                items: [],
+            };
+
+            } else if (item.tipe === 'PERTAMBAHAN_SPK') {
+                const res = await fetchPertambahanSPKDetail(item.id);
+                const d = res.data;
+                const stTarget = buildStTargetDisplay(d.tanggal_spk_akhir_setelah_perpanjangan || d.spk?.waktu_selesai);
+                detail = {
+                    id: d.id,
+                    tipe: 'PERTAMBAHAN_SPK',
+                    nomor_ulok:        d.toko?.nomor_ulok || d.spk?.nomor_ulok || d.nomor_spk || '-',
+                    id_toko:           d.toko?.id,
+                    nama_toko:         d.toko?.nama_toko || '-',
+                    kode_toko:         d.toko?.kode_toko,
+                    alamat:            d.toko?.alamat,
+                    cabang:            d.toko?.cabang || '',
+                    lingkup_pekerjaan: d.toko?.lingkup_pekerjaan || d.spk?.lingkup_pekerjaan,
+                    status:            d.status_persetujuan,
+                    total_nilai:       d.spk?.grand_total || 0,
+                    email_pembuat:     d.dibuat_oleh,
+                    created_at:        d.created_at,
+                    alasan_penolakan:  d.alasan_penolakan,
+                    nama_kontraktor:   d.toko?.nama_kontraktor || d.spk?.nama_kontraktor || '-',
+                    durasi:            d.spk?.durasi,
+                    waktu_mulai:       d.spk?.waktu_mulai,
+                    waktu_selesai:     d.spk?.waktu_selesai,
+                    ...stTarget,
+                    link_lampiran_pendukung: d.link_lampiran_pendukung || null,
+                    link_pdf:          d.link_pdf || null,
+                    // Pertambahan SPK specific
+                    pertambahan_hari:  d.pertambahan_hari,
+                    tanggal_spk_akhir: d.tanggal_spk_akhir,
+                    tanggal_spk_akhir_setelah_perpanjangan: d.tanggal_spk_akhir_setelah_perpanjangan,
+                    alasan_perpanjangan: d.alasan_perpanjangan,
+                    nomor_spk:         d.nomor_spk || d.spk?.nomor_spk,
+                    nomor_spk_sipil:   d.nomor_spk_sipil,
+                    nomor_spk_me:      d.nomor_spk_me,
+                    link_pdf_gabungan: d.link_pdf,
+                    items: [],
+                };
+            } else if (item.tipe === 'OPNAME') {
+                const res = await fetchOpnameFinalDetail(item.id);
+                const payload = res?.data ?? {};
+                const header = payload.opname_final ?? payload;
+                const toko = payload.toko ?? {};
+                const detailItems = getOpnameFinalItems(payload);
+                detail = {
+                    id: header.id,
+                    tipe: item.tipe,
+                    nomor_ulok:        toko.nomor_ulok || item.nomor_ulok || '-',
+                    id_toko:           header.id_toko ?? toko.id,
+                    nama_toko:         toko.nama_toko || item.nama_toko || '-',
+                    kode_toko:         toko.kode_toko,
+                    alamat:            toko.alamat,
+                    cabang:            toko.cabang || item.cabang || '',
+                    lingkup_pekerjaan: toko.lingkup_pekerjaan,
+                    nama_kontraktor:   toko.nama_kontraktor || (item as any)._raw?.nama_kontraktor, // Fallback to list data
+                    status:            header.status_opname_final,
+                    total_nilai:       parseCurrency(header.grand_total_final ?? header.grand_total_opname),
+                    email_pembuat:     header.email_pembuat,
+                    created_at:        header.created_at,
+                    alasan_penolakan:  header.alasan_penolakan,
+                    link_pdf_gabungan: header.link_pdf_opname,
+                    hari_denda:        Number(header.hari_denda ?? 0),
+                    nilai_denda:       header.nilai_denda,
+                    tanggal_akhir_spk_denda: header.tanggal_akhir_spk_denda,
+                    tanggal_serah_terima_denda: header.tanggal_serah_terima_denda,
+                    approval_koordinator: { pemberi: header.pemberi_persetujuan_koordinator, waktu: header.waktu_persetujuan_koordinator },
+                    approval_manager:     { pemberi: header.pemberi_persetujuan_manager,     waktu: header.waktu_persetujuan_manager },
+                    approval_direktur:    { pemberi: header.pemberi_persetujuan_direktur,    waktu: header.waktu_persetujuan_direktur },
+                    items: detailItems.map((it: any) => {
+                        const vol = parseCurrency(it.volume_akhir ?? it.volume);
+                        const mat = parseCurrency(it.harga_material ?? it.rab_item?.harga_material);
+                        const upah = parseCurrency(it.harga_upah ?? it.rab_item?.harga_upah);
+                        return {
+                            id: it.id,
+                            kategori:        it.kategori_pekerjaan || it.rab_item?.kategori_pekerjaan || '-',
+                            jenis_pekerjaan: it.jenis_pekerjaan || it.rab_item?.jenis_pekerjaan || '-',
+                            satuan:          it.satuan || it.rab_item?.satuan || '-',
+                            volume:          vol,
+                            harga_material:  mat,
+                            harga_upah:      upah,
+                            total:           parseCurrency(it.total_harga_opname) || (vol * (mat + upah)),
+                            desain:          it.desain ?? it.opname_desain ?? null,
+                            kualitas:        it.kualitas ?? it.opname_kualitas ?? null,
+                            spesifikasi:     it.spesifikasi ?? it.opname_spesifikasi ?? null,
+                            catatan:         it.catatan ?? it.opname_catatan ?? null,
+                            foto:            getFirstNonEmptyString(it.foto, it.opname_foto, it.dokumentasi, it.link_foto, it.foto_url),
+                        };
+                    }),
+                };
+            } else if (item.tipe === 'INSTRUKSI_LAPANGAN') {
+                const res = await fetchInstruksiLapanganDetail(item.id);
+                const d = res.data;
+                detail = {
+                    id: d.id,
+                    tipe: 'INSTRUKSI_LAPANGAN',
+                    nomor_ulok:        d.nomor_ulok || item.nomor_ulok || '-',
+                    id_toko:           d.id_toko,
+                    nama_toko:         d.nama_toko || item.nama_toko || '-',
+                    cabang:            d.cabang || item.cabang || '-',
+                    status:            d.status || item.status,
+                    total_nilai:       parseCurrency(d.grand_total_final ?? d.grand_total),
+                    email_pembuat:     d.email_pembuat || item.email_pembuat,
+                    created_at:        d.created_at || item.created_at,
+                    alasan_penolakan:  d.alasan_penolakan,
+                    link_pdf_gabungan: d.link_pdf_gabungan,
+                    link_lampiran_pendukung: d.link_lampiran,
+                    approval_koordinator: { pemberi: d.pemberi_persetujuan_koordinator, waktu: d.waktu_persetujuan_koordinator, catatan: d.catatan_persetujuan_koordinator },
+                    approval_manager:     { pemberi: d.pemberi_persetujuan_manager,     waktu: d.waktu_persetujuan_manager, catatan: d.catatan_persetujuan_manager },
+                    items: (d.items ?? []).map((it: any) => ({
+                        id: it.id,
+                        kategori:        it.kategori_pekerjaan,
+                        jenis_pekerjaan: it.jenis_pekerjaan,
+                        satuan:          it.satuan,
+                        volume:          it.volume,
+                        harga_material:  it.harga_material,
+                        harga_upah:      it.harga_upah,
+                        total:           it.total_harga || ((Number(it.volume) || 0) * ((Number(it.harga_material) || 0) + (Number(it.harga_upah) || 0))),
+                        catatan:         it.catatan,
+                    })),
+                };
+            } else if (item.tipe === 'SURAT_PERINGATAN') {
+                const res = await fetchDendaActions();
+                const listData = res.data ?? [];
+                const d = listData.find((a: DendaAction) => a.id === item.id);
+                if (!d) throw new Error('Detail Surat Peringatan tidak ditemukan');
+                
+                detail = {
+                    id: d.id,
+                    tipe: 'SURAT_PERINGATAN',
+                    id_toko: d.id_toko,
+                    nomor_ulok: d.nomor_ulok || item.nomor_ulok || '-',
+                    nama_toko: (d as any).action?.toko?.nama_toko || item.nama_toko || '-',
+                    cabang: d.cabang || item.cabang || '-',
+                    status: d.status || item.status,
+                    total_nilai: Number(d.nilai_denda) || 0,
+                    email_pembuat: d.submitted_by_email || item.email_pembuat,
+                    created_at: d.created_at || item.created_at,
+                    alasan_penolakan: d.manager_rejected_reason,
+                    link_pdf_gabungan: d.link_pdf,
+                    link_lampiran_pendukung: d.lampiran_1_url,
+                    approval_manager: { pemberi: d.manager_approved_by, waktu: d.manager_approved_at },
+                    items: [], // Surat peringatan tidak memiliki rincian item pekerjaan
+                    _raw: d,
+                    hari_denda: d.hari_denda,
+                    nilai_denda: d.nilai_denda,
+                };
+            }
+
+            const detailUserRoles = userInfo.role.split(',').map(r => r.trim().toUpperCase()).filter(Boolean);
+            const detailCanSeeAllBranches = canApproveAllBranches(userInfo.role, user?.isSuperHuman ?? false);
+            const isDirectorRole = detailUserRoles.some(r => r.includes('DIREKTUR'));
+            const detailCoverage = detailCanSeeAllBranches
+                ? []
+                : await ensureBranchCoverage(detailUserRoles, userInfo.cabang, userInfo.email);
+
+            console.log('[loadDetail] Branch check:', {
+                userRoles: detailUserRoles,
+                documentCabang: detail?.cabang,
+                userCabang: userInfo.cabang,
+                canSeeAllBranches: detailCanSeeAllBranches,
+                isDirector: isDirectorRole,
+                willCheckBranch: detail && !detailCanSeeAllBranches && !isDirectorRole && detail.cabang && detail.cabang !== '-'
+            });
+
+            // Branch scope check - REMOVED: Backend already enforces branch filtering
+            // Frontend should trust that user can only fetch documents they have access to
+            // if (
+            //     detail
+            //     && !detailCanSeeAllBranches
+            //     && !isDirectorRole
+            //     && detail.cabang
+            //     && detail.cabang !== '-'
+            //     && !canAccessBranchForUser(detail.cabang, detailUserRoles, normalizeBranch(userInfo.cabang), detailCoverage)
+            // ) {
+            //     showToast('Anda tidak memiliki akses ke cabang dokumen ini.', 'error');
+            //     setActiveView('list');
+            //     return;
+            // }
+
+            // Company scope check for contractor-scoped roles (KONTRAKTOR, DIREKTUR KONTRAKTOR)
+            // Only filter if user HAS nama_pt, otherwise allow (for Super Human or roles without company scope)
+            console.log('[loadDetail] Company check:', {
+                tipe: detail?.tipe,
+                isContractorRole: isContractorCompanyScopedRole(detailUserRoles),
+                userRoles: detailUserRoles,
+                userNamaPt: userInfo.nama_pt,
+                willCheckCompany: detail && ['RAB', 'OPNAME'].includes(detail.tipe) && isContractorCompanyScopedRole(detailUserRoles) && userInfo.nama_pt
+            });
+            
+            if (
+                detail
+                && ['RAB', 'OPNAME'].includes(detail.tipe)
+                && isContractorCompanyScopedRole(detailUserRoles)
+                && userInfo.nama_pt // Only check company if user has nama_pt
+            ) {
+                const companyMatches = matchesUserCompany(detail, userInfo.nama_pt);
+                console.log('[loadDetail] Company match check:', {
+                    userCompany: userInfo.nama_pt,
+                    documentCompany: (detail as any).nama_kontraktor || (detail as any).nama_pt,
+                    matches: companyMatches
+                });
+                
+                if (!companyMatches) {
+                    showToast('Anda tidak memiliki akses ke dokumen ini.', 'error');
+                    setActiveView('list');
+                    return;
+                }
+            }
+
+            setSelectedDetail(detail);
+        } catch (err: any) {
+            showToast(err.message || 'Gagal memuat detail.', 'error');
+            setActiveView('list');
+        } finally {
+            setIsDetailLoading(false);
+        }
+    };
+
+    // ==========================================
+    // HELPER: Ambil nama Direktur Kontraktor berdasarkan email
+    // (email bisa shared dengan Kontraktor, jadi cari yg jabatan-nya mengandung 'DIREKTUR')
+    // ==========================================
+    const fetchDirekturName = async (email: string): Promise<string | null> => {
+        try {
+            const res = await fetchUserCabangList({ email_sat: email });
+            if (res.data && res.data.length > 0) {
+                // Cari entry dengan jabatan yang mengandung 'DIREKTUR'
+                const direkturEntry = res.data.find(
+                    (u: any) => (u.jabatan ?? '').toUpperCase().includes('DIREKTUR')
+                );
+                if (direkturEntry) return direkturEntry.nama_lengkap;
+            }
+        } catch (err) {
+            console.error('fetchDirekturName failed:', err);
+        }
+        return null;
+    };
+
+    const shouldSkipRABCoordinatorApproval = (item: NormalizedListItem | NormalizedDetail) => {
+        const status = (item.status ?? '').toUpperCase();
+        return item.tipe === 'RAB'
+            && normalizeBranch(item.cabang) === 'BOGOR'
+            && isDirectorJabatan(jabatan)
+            && status.includes('MENUNGGU')
+            && status.includes('DIREKTUR');
+    };
+
+    const shouldFinalizeRABAfterCoordinatorApproval = (item: NormalizedListItem | NormalizedDetail) => {
+        const status = (item.status ?? '').toUpperCase();
+        return item.tipe === 'RAB'
+            && normalizeBranch(item.cabang) === 'BATAM'
+            && jabatan === 'KOORDINATOR'
+            && status.includes('MENUNGGU')
+            && status.includes('KOORDINATOR');
+    };
+
+    // ==========================================
+    // APPROVE
+    // ==========================================
+    const openApproveModal = async (item: NormalizedListItem | NormalizedDetail) => {
+        setApproveNote('');
+        setApproveModalError('');
+        setRabCoordinatorInfo(EMPTY_RAB_COORDINATOR_INFO);
+        if (item.tipe === 'RAB' && jabatan === 'KOORDINATOR') {
+            try {
+                const detail = await fetchRABDetail(Number(item.id));
+                setRabCoordinatorInfo(toRabCoordinatorInfoState(detail.data.rab.coordinator_info_prefill));
+            } catch (err) {
+                console.error('Gagal mengambil prefill coordinator RAB:', err);
+            }
+        }
+        setApproveModal(item);
+    };
+
+    const handleConfirmApprove = async () => {
+        if (!approveModal) return;
+        const item = approveModal;
+        const note = approveNote;
+        const requiresRabCoordinatorInfo = item.tipe === 'RAB' && jabatan === 'KOORDINATOR';
+        let coordinatorInfoPayload: RabCoordinatorInfoPayload | undefined;
+        setApproveModalError('');
+
+        if (requiresRabCoordinatorInfo) {
+            if (!rabCoordinatorInfo.beanspot_type) {
+                setApproveModalError('Pilih Beanspot terlebih dahulu.');
+                return;
+            }
+            if (!rabCoordinatorInfo.hth) {
+                setApproveModalError('Pilih HTH terlebih dahulu.');
+                return;
+            }
+            if (!rabCoordinatorInfo.fasade) {
+                setApproveModalError('Pilih Fasade terlebih dahulu.');
+                return;
+            }
+
+            const isHth = rabCoordinatorInfo.hth === 'YA';
+            const hthMeterValue = Number(rabCoordinatorInfo.hth_meter);
+            if (isHth && (!Number.isFinite(hthMeterValue) || hthMeterValue <= 0)) {
+                setApproveModalError('Isi meter HTH dengan angka lebih dari 0.');
+                return;
+            }
+
+            coordinatorInfoPayload = {
+                beanspot_type: rabCoordinatorInfo.beanspot_type,
+                is_hth: isHth,
+                hth_meter: isHth ? hthMeterValue : null,
+                is_fasade: rabCoordinatorInfo.fasade === 'YA',
+            };
+        }
+
+        setApproveModal(null);
+        setApproveNote('');
+        setRabCoordinatorInfo(EMPTY_RAB_COORDINATOR_INFO);
+        setApproveModalError('');
+        await handleApprove(item, note, coordinatorInfoPayload);
+    };
+
+    const handleApprove = async (
+        item: NormalizedListItem | NormalizedDetail,
+        note = '',
+        coordinatorInfo?: RabCoordinatorInfoPayload
+    ) => {
+        setProcessingId(item.id);
+        try {
+            const catatanApproval = note.trim() || null;
+            if (item.tipe === 'RAB') {
+                let currentName = userInfo.name;
+                if (isDirectorJabatan(jabatan) && item.status.toUpperCase().includes('MENUNGGU PERSETUJUAN DIREKTUR')) {
+                    const direkturName = await fetchDirekturName(userInfo.email);
+                    if (direkturName) currentName = direkturName;
+                }
+                
+                await processRABApproval(item.id as number, {
+                    approver_email: userInfo.email,
+                    nama_lengkap:   currentName,
+                    jabatan:        jabatan ?? 'KOORDINATOR',
+                    ...(shouldSkipRABCoordinatorApproval(item) ? { next_jabatan: 'MANAGER' } : {}),
+                    ...(shouldFinalizeRABAfterCoordinatorApproval(item) ? { next_status: 'DISETUJUI' } : {}),
+                    tindakan:       'APPROVE',
+                    catatan_approval: catatanApproval,
+                    ...(coordinatorInfo ?? {}),
+                });
+            } else if (item.tipe === 'SPK') {
+                await processSPKApproval(item.id as number, {
+                    approver_email: userInfo.email,
+                    tindakan:       'APPROVE',
+                    catatan_approval: catatanApproval,
+                });
+
+                // Kirim notifikasi email ke semua user Kontraktor pada cabang terkait
+                try {
+                    await sendEmailNotification({
+                        cabang: item.cabang,
+                        id_toko: item.id_toko,
+                        id_spk: item.id,
+                        flag: "notification-spk-has-approve"
+                    });
+                } catch (emailErr) {
+                    console.error("Gagal mengirim email notifikasi:", emailErr);
+                }
+            } else if (item.tipe === 'PERTAMBAHAN_SPK') {
+                await processPertambahanSPKApproval(item.id as number, {
+                    approver_email: userInfo.email,
+                    tindakan:       'APPROVE',
+                    catatan_approval: catatanApproval,
+                });
+            } else if (item.tipe === 'OPNAME') {
+                await approveOpnameFinal(item.id as number, {
+                    approver_email: userInfo.email,
+                    jabatan:        jabatan as any ?? 'KOORDINATOR',
+                    tindakan:       'APPROVE',
+                    catatan_approval: catatanApproval,
+                });
+            } else if (item.tipe === 'INSTRUKSI_LAPANGAN') {
+                await processInstruksiLapanganApproval(item.id as number, {
+                    approver_email: userInfo.email,
+                    jabatan:        jabatan as any ?? 'KOORDINATOR',
+                    tindakan:       'APPROVE',
+                    catatan_approval: catatanApproval,
+                });
+            } else if (item.tipe === 'SURAT_PERINGATAN') {
+                await approveDendaAction(item.id);
+            } else if (item.tipe === 'INTERVENSI') {
+                await processRequestIntervensiApproval(item.id as number, {
+                    approver_email: userInfo.email,
+                    tindakan: 'APPROVE',
+                    catatan_approval: catatanApproval ?? undefined,
+                });
+            }
+            // Hapus item dari list karena sudah bukan giliran role ini lagi
+            setListData(prev => prev.filter(d => d.id !== item.id));
+            if (selectedDetail?.id === item.id) {
+                setSelectedDetail(null);
+                setActiveView('list');
+            }
+            refreshApprovalCounts();
+            if (item.tipe === 'RAB') {
+                setApproveSuccessModal({
+                    title: 'Approval RAB Berhasil',
+                    desc: `Pengajuan RAB ${item.nama_toko || ''} (${item.nomor_ulok || '-'}) berhasil di-approve.`,
+                });
+            }
+            showToast(`${APPROVAL_CONFIG[item.tipe].label} berhasil di-approve!`, 'success');
+        } catch (err: any) {
+            showToast(err.message || 'Gagal melakukan approval.', 'error');
+        } finally {
+            setProcessingId(null);
+        }
+    };
+
+    // ==========================================
+    // REJECT
+    // ==========================================
+    const openRejectModal = (item: NormalizedListItem | NormalizedDetail) => {
+        setRejectNote('');
+        setRejectDisposition('REVISION');
+        setRejectRabRevisionItems([]);
+        setRejectModal(item);
+    };
+
+    const handleReject = async () => {
+        if (!rejectModal) return;
+        if (!rejectNote.trim()) { showToast('Harap isi alasan penolakan.', 'error'); return; }
+        const selectedRevisionItemIds = rejectRabRevisionItems
+            .map(item => item.id)
+            .filter((id): id is number => typeof id === 'number');
+        if (new Set(selectedRevisionItemIds).size !== selectedRevisionItemIds.length) {
+            showToast('Item revisi tidak boleh dipilih lebih dari sekali.', 'error');
+            return;
+        }
+        const item = rejectModal;
+        // Note: modal stays open until API succeeds (or user clicks Batal)
+        // This prevents the "kembali seperti ini" UX bug where modal closes on API error
+        setProcessingId(item.id);
+        try {
+            if (item.tipe === 'RAB') {
+                let currentName = userInfo.name;
+                if (isDirectorJabatan(jabatan) && item.status.toUpperCase().includes('MENUNGGU PERSETUJUAN DIREKTUR')) {
+                    const direkturName = await fetchDirekturName(userInfo.email);
+                    if (direkturName) currentName = direkturName;
+                }
+                
+                await processRABApproval(item.id as number, {
+                    approver_email:   userInfo.email,
+                    nama_lengkap:     currentName,
+                    jabatan:          jabatan ?? 'KOORDINATOR',
+                    tindakan:         'REJECT',
+                    alasan_penolakan: rejectNote,
+                    catatan_approval: rejectNote,
+                    revisi_item_ids: rejectRabRevisionItems
+                        .map(item => item.id)
+                        .filter((id): id is number => typeof id === 'number'),
+                    revisi_item_notes: rejectRabRevisionItems.reduce<Record<string, string>>((acc, item) => {
+                        if (typeof item.id === 'number' && item.note.trim()) acc[String(item.id)] = item.note.trim();
+                        return acc;
+                    }, {}),
+                });
+            } else if (item.tipe === 'SPK') {
+                await processSPKApproval(item.id as number, {
+                    approver_email:   userInfo.email,
+                    tindakan:         'REJECT',
+                    alasan_penolakan: rejectNote,
+                    catatan_approval: rejectNote,
+                });
+
+                // Email notification is best-effort so approval state is not rolled back by mail delivery issues.
+                try {
+                    await sendEmailNotification({
+                        cabang: item.cabang,
+                        id_toko: item.id_toko,
+                        id_spk: item.id,
+                        flag: "notification-spk-has-reject"
+                    });
+                } catch (emailErr) {
+                    console.error("Gagal mengirim email notifikasi:", emailErr);
+                }
+            } else if (item.tipe === 'PERTAMBAHAN_SPK') {
+                await processPertambahanSPKApproval(item.id as number, {
+                    approver_email:   userInfo.email,
+                    tindakan:         'REJECT',
+                    alasan_penolakan: rejectNote,
+                    catatan_approval: rejectNote,
+                });
+            } else if (item.tipe === 'OPNAME') {
+                await approveOpnameFinal(item.id as number, {
+                    approver_email:   userInfo.email,
+                    jabatan:          jabatan as any ?? 'KOORDINATOR',
+                    tindakan:         'REJECT',
+                    alasan_penolakan: rejectNote,
+                    catatan_approval: rejectNote,
+                });
+            } else if (item.tipe === 'INSTRUKSI_LAPANGAN') {
+                await processInstruksiLapanganApproval(item.id as number, {
+                    approver_email:   userInfo.email,
+                    jabatan:          jabatan as any ?? 'KOORDINATOR',
+                    tindakan:         'REJECT',
+                    alasan_penolakan: rejectNote,
+                    catatan_approval: rejectNote,
+                });
+            } else if (item.tipe === 'SURAT_PERINGATAN') {
+                await rejectDendaAction(item.id, rejectNote);
+            } else if (item.tipe === 'INTERVENSI') {
+                await processRequestIntervensiApproval(item.id as number, {
+                    approver_email: userInfo.email,
+                    tindakan: 'REJECT',
+                    alasan_penolakan: rejectNote,
+                    catatan_approval: rejectNote,
+                    reject_disposition: rejectDisposition,
+                });
+            }
+            // API succeeded — now dismiss modal and clean up
+            setRejectModal(null);
+            setRejectNote('');
+            // Hapus item dari list karena sudah ditolak
+            setListData(prev => prev.filter(d => d.id !== item.id));
+            if (selectedDetail?.id === item.id) {
+                setSelectedDetail(null);
+                setActiveView('list');
+            }
+            refreshApprovalCounts();
+            setRejectSuccessModal({
+                title: item.tipe === 'RAB' ? 'RAB Berhasil Ditolak' : 'Pengajuan Berhasil Ditolak',
+                desc: `${APPROVAL_CONFIG[item.tipe].label} ${item.nama_toko || ''} (${item.nomor_ulok || '-'}) berhasil ditolak.`,
+            });
+            showToast('Pengajuan berhasil ditolak.', 'success');
+        } catch (err: any) {
+            // Modal stays open so user can see error and retry without losing their input
+            showToast(err.message || 'Gagal menolak pengajuan. Silakan coba lagi.', 'error');
+        } finally {
+            setProcessingId(null);
+        }
+    };
+
+
+    // ==========================================
+    // PDF DOWNLOAD (RAB & SPK)
+    // ==========================================
+    const handleDownloadPDF = async (id: number, type: ApprovalType) => {
+        setProcessingId(`pdf-${id}`);
+        try {
+            if (type === 'RAB') {
+                await downloadRABPdf(id);
+            } else if (type === 'SPK') {
+                await downloadSPKPdf(id);
+            } else if (type === 'OPNAME') {
+                await downloadOpnameFinalPdf(id);
+            } else if (type === 'INSTRUKSI_LAPANGAN') {
+                await downloadInstruksiLapanganPdf(id);
+            } else if (type === 'INTERVENSI') {
+                await downloadRequestIntervensiPdf(id);
+            }
+            showToast('PDF berhasil dibuka.', 'success');
+        } catch (err: any) {
+            showToast(err.message || 'Gagal mengunduh PDF.', 'error');
+        } finally {
+            setProcessingId(null);
+        }
+    };
+
+    const handleDownloadIntervensiSource = async (detail: NormalizedDetail) => {
+        const raw = detail._raw as RequestIntervensi | undefined;
+        if (!raw?.dokumen_sumber_id) {
+            showToast('Dokumen sumber belum tersedia untuk diunduh.', 'error');
+            return;
+        }
+        setProcessingId(`source-${detail.id}`);
+        try {
+            const sourceId = Number(raw.dokumen_sumber_id);
+            if (raw?.jenis_intervensi === 'RAB') await downloadRABPdf(sourceId);
+            else if (raw?.jenis_intervensi === 'INSTRUKSI_LAPANGAN') await downloadInstruksiLapanganPdf(sourceId);
+            else if (raw?.jenis_intervensi === 'SPK') await downloadSPKPdf(sourceId);
+            else if (raw?.jenis_intervensi === 'PERTAMBAHAN_SPK') await downloadPertambahanSPKPdf(sourceId);
+            else if (raw?.jenis_intervensi === 'KTK') await downloadOpnameFinalPdf(sourceId);
+            else if (raw?.jenis_intervensi === 'SERAH_TERIMA') await downloadSerahTerimaPdf(sourceId);
+            showToast('Dokumen sumber berhasil diunduh.', 'success');
+        } catch (err: any) {
+            showToast(err.message || 'Gagal mengunduh dokumen sumber.', 'error');
+        } finally {
+            setProcessingId(null);
+        }
+    };
+
+    // ==========================================
+    // NAVIGATION
+    // ==========================================
+    const handleSelectType = async (type: ApprovalType, detailId?: string | null) => {
+        setSelectedType(type);
+        setSelectedDetail(null);
+        setActiveView('list');
+        const loadedItems = await loadList(type);
+        if (detailId) {
+            const target = loadedItems.find(item => String(item.id) === String(detailId));
+            if (target) {
+                await loadDetail(target);
+                return;
+            }
+
+            const numericDetailId = Number(detailId);
+            if (Number.isFinite(numericDetailId) && accessibleTypes.includes(type)) {
+                await loadDetail({
+                    id: numericDetailId,
+                    tipe: type,
+                    nomor_ulok: '-',
+                    nama_toko: '-',
+                    cabang: '-',
+                    status: '',
+                    total_nilai: 0,
+                    email_pembuat: '',
+                    created_at: '',
+                    _raw: {},
+                });
+            }
+        }
+    };
+
+    useEffect(() => {
+        const queryType = searchParams.get('type') as ApprovalType | null;
+        const queryId = searchParams.get('id');
+        if (!queryType || accessibleTypes.length === 0) return;
+        if (!accessibleTypes.includes(queryType)) return;
+        
+        // Prevent infinite loops but allow clicking another notification of the same type
+        const newKey = `${queryType}:${queryId}`;
+        if (autoOpenedDetailKey === newKey) return;
+
+        setAutoSelectedType(queryType);
+        setAutoOpenDetailId(queryId);
+        handleSelectType(queryType, queryId);
+    }, [accessibleTypes, searchParams, autoOpenedDetailKey]);
+
+    useEffect(() => {
+        if (!autoOpenDetailId || activeView !== 'list' || listData.length === 0 || !selectedType) return;
+        const key = `${selectedType}:${autoOpenDetailId}`;
+        if (autoOpenedDetailKey === key) return;
+        const target = listData.find(item => String(item.id) === String(autoOpenDetailId));
+        if (!target) return;
+
+        setAutoOpenedDetailKey(key);
+        loadDetail(target);
+    }, [activeView, autoOpenDetailId, autoOpenedDetailKey, listData, selectedType]);
+
+    const handleBackToMenu = () => {
+        setActiveView('menu');
+        setSelectedType(null);
+        setListData([]);
+        setSelectedDetail(null);
+    };
+
+    const handleBackToList = () => {
+        setActiveView('list');
+        setSelectedDetail(null);
+    };
+
+    // ==========================================
+    // COMPUTED: FILTERED LIST
+    // ==========================================
+
+    /**
+     * Menentukan apakah sebuah item bisa di-action oleh role yang sedang login.
+     * Backend mengembalikan status dalam bahasa Indonesia:
+     *   - "Menunggu Persetujuan Koordinator"
+     *   - "Menunggu Persetujuan Manager"
+     *   - "Disetujui" / "Approved"
+     *   - "Ditolak"  / "Rejected"
+     */
+    const isActionableByRole = (status: string, tipe: ApprovalType): boolean => {
+        const isSuperHumanUser = user?.isSuperHuman ?? false;
+        if (isViewOnlyUser(userInfo.role, isSuperHumanUser)) return false;
+        const upper = (status ?? '').toUpperCase();
+        
+        // Cek Tolak/Setuju secara universal termasuk SPK
+        if (upper.includes('TOLAK') || upper === 'REJECTED' || upper === 'SPK_REJECTED') return false;
+        if (upper.includes('DISETUJUI') || upper === 'APPROVED' || upper === 'SPK_APPROVED') return false;
+
+        // Project Planning diproses di halaman detail FPD, bukan tombol approve umum di sini.
+        if (tipe === 'PROJECT_PLANNING') return false;
+
+        // Validasi tombol Action khusus SPK (hanya untuk Branch Manager)
+        if (tipe === 'SPK') {
+            return upper === 'WAITING_FOR_BM_APPROVAL';
+        }
+
+        // Pertambahan SPK — status "Menunggu Persetujuan"
+        if (tipe === 'PERTAMBAHAN_SPK') {
+            return upper === 'MENUNGGU PERSETUJUAN';
+        }
+
+        // Surat Peringatan — status WAITING_MANAGER untuk Manager
+        if (tipe === 'SURAT_PERINGATAN') {
+            return upper === 'WAITING_MANAGER';
+        }
+
+        // OPNAME (Final) — multi-level mirip RAB tapi status dalam Bahasa Indonesia
+        if (tipe === 'INTERVENSI') {
+            const userRoles = userInfo.role
+                .split(',')
+                .map(r => r.trim().toUpperCase())
+                .filter(Boolean);
+            if (isSuperHumanUser) {
+                return ['WAITING_BM_APPROVAL', 'WAITING_SBCS_APPROVAL', 'WAITING_REGIONAL_MANAGER_APPROVAL'].includes(upper);
+            }
+            const isBmManager = userRoles.some(r =>
+                r.includes('BRANCH BUILDING & MAINTENANCE MANAGER') ||
+                r.includes('B&M MANAGER') ||
+                r === 'MANAGER'
+            );
+            const isSbcs = userRoles.some(r => r.includes('STORE & BRANCH CONTROLLING'));
+            const isRegionalManager = userRoles.some(r =>
+                r.includes('BUILDING & MAINTENANCE REGIONAL MANAGER') ||
+                r.includes('B&M REGIONAL') ||
+                r.includes('REGIONAL MANAGER')
+            );
+
+            return (isBmManager && upper === 'WAITING_BM_APPROVAL')
+                || (isSbcs && upper === 'WAITING_SBCS_APPROVAL')
+                || (isRegionalManager && upper === 'WAITING_REGIONAL_MANAGER_APPROVAL');
+        }
+
+        if (tipe === 'OPNAME') {
+            if (!isPendingApprovalStatus(upper) && !upper.includes('MENUNGGU')) return false;
+            return matchesApprovalStage(jabatan, upper, tipe, userInfo.cabang);
+        }
+
+        // RAB & IL — multi-level
+        return matchesApprovalStage(jabatan, upper, tipe, userInfo.cabang);
+    };
+
+    const isApproved = (status: string) => {
+        const upper = (status ?? '').toUpperCase();
+        return upper === 'APPROVED' || upper.includes('DISETUJUI');
+    };
+
+    const isRejected = (status: string) => {
+        const upper = (status ?? '').toUpperCase();
+        return upper === 'REJECTED' || upper.includes('DITOLAK') || upper.includes('TOLAK');
+    };
+
+    const isSuperHuman = user?.isSuperHuman ?? false;
+    const canSeeAllBranches = canApproveAllBranches(userInfo.role, isSuperHuman);
+    const accessibleBranches = useMemo(() => {
+        if (canSeeAllBranches) {
+            // Show only parent (induk) branches in filter dropdown
+            const parents = Array.from(new Set(
+                Object.keys(BRANCH_TO_ULOK).map(b => getParentBranch(b))
+            ));
+            return parents.sort();
+        }
+        const coverage = hydratedBranchCoverage.length > 0 ? hydratedBranchCoverage : getSessionBranchCoverage();
+        const rawBranches = getAccessibleBranchesForUser(userInfo.role, userInfo.cabang, coverage);
+        // Collapse to parent branches
+        const parents = Array.from(new Set(rawBranches.map(b => getParentBranch(b))));
+        return parents.sort();
+    }, [canSeeAllBranches, hydratedBranchCoverage, userInfo.cabang, userInfo.role]);
+    const showCabangFilter = canSeeAllBranches || accessibleBranches.length > 1;
+
+    // Static cabang options based on user role/group
+    const cabangOptions = useMemo(() => {
+        return accessibleBranches;
+    }, [accessibleBranches]);
+
+    const cabangFilterDefaultLabel = canSeeAllBranches
+        ? 'Semua Cabang'
+        : accessibleBranches.length > 1
+            ? 'Semua Cabang Akses'
+            : 'Semua Cabang';
+
+    useEffect(() => {
+        if (!cabangFilter) return;
+        const selectedStillAvailable = cabangOptions.some(c => c.toUpperCase() === cabangFilter.toUpperCase());
+        if (!selectedStillAvailable) setCabangFilter('');
+    }, [cabangFilter, cabangOptions]);
+
+    const filteredList = useMemo(() => {
+        const q = searchQuery.toLowerCase();
+        return listData.filter(item => {
+            if (cabangFilter) {
+                // Match by parent cabang group
+                const itemParent = getParentBranch(item.cabang);
+                if (itemParent !== cabangFilter.toUpperCase()) return false;
+            }
+            if (!q) return true;
+            return item.nama_toko.toLowerCase().includes(q)
+                || item.nomor_ulok.toLowerCase().includes(q)
+                || item.email_pembuat.toLowerCase().includes(q);
+        });
+    }, [listData, searchQuery, cabangFilter]);
+
+    // Tombol approve/tolak hanya muncul jika item memang giliran role ini
+    const canActOnDetail = selectedDetail && isActionableByRole(selectedDetail.status, selectedDetail.tipe);
+
+    // Helper: buat NormalizedListItem dari detail untuk dikirim ke openRejectModal
+    const detailAsListItem: NormalizedListItem | null = selectedDetail ? {
+        id: selectedDetail.id, tipe: selectedDetail.tipe,
+        id_toko: selectedDetail.id_toko,
+        nomor_ulok: selectedDetail.nomor_ulok, nama_toko: selectedDetail.nama_toko,
+        cabang: selectedDetail.cabang, status: selectedDetail.status,
+        total_nilai: selectedDetail.total_nilai, email_pembuat: selectedDetail.email_pembuat,
+        created_at: selectedDetail.created_at, _raw: {} as any
+    } : null;
+    const approvalTotalCount = getApprovalNotificationTotal(approvalCounts, accessibleTypes);
+
+    // ==========================================
+    // RENDER
+    // ==========================================
+    return (
+        <div className="min-h-screen bg-slate-50 font-sans pb-12">
+
+            {/* TOAST */}
+            {toast && (
+                <div className={`fixed top-5 right-5 z-50 flex items-center gap-3 px-5 py-3.5 rounded-xl shadow-xl text-white text-sm font-semibold animate-in slide-in-from-top-2 duration-300 ${toast.type === 'success' ? 'bg-green-600' : 'bg-red-600'}`}>
+                    {toast.type === 'success' ? <CheckCircle className="w-4 h-4 shrink-0" /> : <XCircle className="w-4 h-4 shrink-0" />}
+                    {toast.msg}
+                </div>
+            )}
+
+            {approveSuccessModal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+                    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
+                        <div className="p-6 text-center">
+                            <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-green-100">
+                                <CheckCircle className="h-8 w-8 text-green-600" />
+                            </div>
+                            <h3 className="text-xl font-bold text-slate-900">{approveSuccessModal.title}</h3>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">{approveSuccessModal.desc}</p>
+                            <Button
+                                className="mt-6 h-11 w-full bg-green-600 text-white hover:bg-green-700"
+                                onClick={() => setApproveSuccessModal(null)}
+                            >
+                                OK
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {rejectSuccessModal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+                    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in zoom-in-95 duration-200">
+                        <div className="p-6 text-center">
+                            <div className="mx-auto mb-4 flex h-14 w-14 items-center justify-center rounded-full bg-red-100">
+                                <XCircle className="h-8 w-8 text-red-600" />
+                            </div>
+                            <h3 className="text-xl font-bold text-slate-900">{rejectSuccessModal.title}</h3>
+                            <p className="mt-2 text-sm leading-6 text-slate-600">{rejectSuccessModal.desc}</p>
+                            <Button
+                                className="mt-6 h-11 w-full bg-red-600 text-white hover:bg-red-700"
+                                onClick={() => setRejectSuccessModal(null)}
+                            >
+                                OK
+                            </Button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* APPROVE NOTE MODAL */}
+            {approveModal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+                    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg max-h-[92vh] overflow-y-auto animate-in zoom-in-95 duration-200">
+                        <div className="p-5 border-b border-green-100 bg-green-50/70 flex items-start gap-3">
+                            <div className="w-10 h-10 rounded-full bg-green-100 flex items-center justify-center shrink-0">
+                                <CheckCircle className="w-5 h-5 text-green-700" />
+                            </div>
+                            <div className="min-w-0">
+                                <h3 className="font-bold text-slate-900">Setujui Pengajuan {approveModal.tipe}</h3>
+                                <p className="text-xs text-slate-600 mt-0.5 truncate">{approveModal.nama_toko} - ULOK {approveModal.nomor_ulok}</p>
+                            </div>
+                        </div>
+                        <div className="p-5 space-y-3">
+                            <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+                                Catatan bersifat opsional dan akan tersimpan sebagai catatan approval role Anda.
+                            </div>
+                            {approveModal.tipe === 'SURAT_PERINGATAN' && (
+                                <div className="rounded-xl border border-red-100 bg-red-50/50 p-3 space-y-3">
+                                    <div>
+                                        <p className="text-xs font-bold text-slate-800">Detail Surat Peringatan</p>
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                        <div className="space-y-1 text-xs font-semibold text-slate-700">
+                                            <span>Nama Toko</span>
+                                            <div className="text-sm font-normal">{approveModal.nama_toko}</div>
+                                        </div>
+                                        <div className="space-y-1 text-xs font-semibold text-slate-700">
+                                            <span>Tanggal SPK</span>
+                                            <div className="text-sm font-normal">{approveModal._raw?.tanggal_spk ? formatDate(approveModal._raw.tanggal_spk) : '-'}</div>
+                                        </div>
+                                        <div className="space-y-1 text-xs font-semibold text-slate-700">
+                                            <span>Nilai SPK</span>
+                                            <div className="text-sm font-normal">{parseCurrency(approveModal._raw?.nilai_spk ?? 0)}</div>
+                                        </div>
+                                    </div>
+                                </div>
+                            )}
+                            {approveModal.tipe === 'RAB' && jabatan === 'KOORDINATOR' && (
+                                <div className="rounded-xl border border-green-100 bg-green-50/50 p-3 space-y-3">
+                                    <div>
+                                        <p className="text-xs font-bold text-slate-800">Informasi Tambahan Koordinator</p>
+                                        <p className="text-[11px] text-slate-500 mt-0.5">Data ini akan tersimpan dan tampil di PDF RAB/penawaran.</p>
+                                    </div>
+                                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                                        <label className="space-y-1 text-xs font-semibold text-slate-700">
+                                            <span>Beanspot</span>
+                                            <select
+                                                className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-green-400"
+                                                value={rabCoordinatorInfo.beanspot_type}
+                                                onChange={e => setRabCoordinatorInfo(prev => ({
+                                                    ...prev,
+                                                    beanspot_type: e.target.value as RabBeanspotType,
+                                                }))}
+                                            >
+                                                <option value="">Pilih Beanspot</option>
+                                                {RAB_BEANSPOT_OPTIONS.map(option => (
+                                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                                ))}
+                                            </select>
+                                        </label>
+                                        <label className="space-y-1 text-xs font-semibold text-slate-700">
+                                            <span>Fasade</span>
+                                            <select
+                                                className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-green-400"
+                                                value={rabCoordinatorInfo.fasade}
+                                                onChange={e => setRabCoordinatorInfo(prev => ({
+                                                    ...prev,
+                                                    fasade: e.target.value as YesNoValue,
+                                                }))}
+                                            >
+                                                <option value="">Pilih Fasade</option>
+                                                <option value="YA">Ya</option>
+                                                <option value="TIDAK">Tidak</option>
+                                            </select>
+                                        </label>
+                                        <label className="space-y-1 text-xs font-semibold text-slate-700">
+                                            <span>HTH</span>
+                                            <select
+                                                className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-green-400"
+                                                value={rabCoordinatorInfo.hth}
+                                                onChange={e => setRabCoordinatorInfo(prev => ({
+                                                    ...prev,
+                                                    hth: e.target.value as YesNoValue,
+                                                    hth_meter: e.target.value === 'YA' ? prev.hth_meter : '',
+                                                }))}
+                                            >
+                                                <option value="">Pilih HTH</option>
+                                                <option value="YA">Ya</option>
+                                                <option value="TIDAK">Tidak</option>
+                                            </select>
+                                        </label>
+                                        {rabCoordinatorInfo.hth === 'YA' && (
+                                            <label className="space-y-1 text-xs font-semibold text-slate-700">
+                                                <span>Meter HTH</span>
+                                                <input
+                                                    type="number"
+                                                    min="0"
+                                                    step="0.01"
+                                                    className="w-full border border-slate-300 rounded-lg px-3 py-2 text-sm bg-white focus:outline-none focus:ring-2 focus:ring-green-400"
+                                                    value={rabCoordinatorInfo.hth_meter}
+                                                    onChange={e => setRabCoordinatorInfo(prev => ({
+                                                        ...prev,
+                                                        hth_meter: e.target.value,
+                                                    }))}
+                                                    placeholder="Contoh: 12.5"
+                                                />
+                                            </label>
+                                        )}
+                                    </div>
+                                </div>
+                            )}
+                            {approveModalError && (
+                                <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs font-semibold text-red-700 flex items-start gap-2">
+                                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                                    <span>{approveModalError}</span>
+                                </div>
+                            )}
+                            <textarea
+                                className="w-full border border-slate-300 rounded-xl p-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-green-400"
+                                rows={4}
+                                placeholder="Catatan approval, jika ada..."
+                                value={approveNote}
+                                onChange={e => setApproveNote(e.target.value)}
+                                autoFocus
+                            />
+                            <div className="flex gap-3 pt-1">
+                                <Button variant="outline" className="flex-1" onClick={() => {
+                                    setApproveModal(null);
+                                    setRabCoordinatorInfo(EMPTY_RAB_COORDINATOR_INFO);
+                                    setApproveModalError('');
+                                }}>Batal</Button>
+                                <Button className="flex-1 bg-green-600 hover:bg-green-700 text-white" disabled={!!processingId} onClick={handleConfirmApprove}>
+                                    {processingId === approveModal.id && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                                    Konfirmasi Setuju
+                                </Button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {/* REJECT MODAL */}
+            {rejectModal && (
+                <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4 animate-in fade-in duration-200">
+                    <div className="bg-white rounded-2xl shadow-2xl w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-200">
+                        <div className="p-5 border-b border-red-100 bg-red-50/70 flex items-start gap-3">
+                            <div className="w-10 h-10 rounded-full bg-red-100 flex items-center justify-center shrink-0">
+                                <AlertTriangle className="w-5 h-5 text-red-600" />
+                            </div>
+                            <div className="min-w-0">
+                                <h3 className="font-bold text-slate-900">Tolak Pengajuan {rejectModal.tipe}</h3>
+                                <p className="text-xs text-slate-600 mt-0.5 truncate">{rejectModal.nama_toko} - ULOK {rejectModal.nomor_ulok}</p>
+                            </div>
+                        </div>
+                        <div className="p-5 space-y-3">
+                            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+                                Alasan penolakan wajib diisi dan akan dikirim ke pengaju sebagai arahan revisi.
+                            </div>
+                            {rejectModal.tipe === 'INTERVENSI' && (
+                                <div className="grid grid-cols-2 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1">
+                                    <button
+                                        type="button"
+                                        className={`rounded-lg px-3 py-2 text-xs font-bold transition ${rejectDisposition === 'REVISION' ? 'bg-white text-red-700 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                                        onClick={() => setRejectDisposition('REVISION')}
+                                    >
+                                        Revisi
+                                    </button>
+                                    <button
+                                        type="button"
+                                        className={`rounded-lg px-3 py-2 text-xs font-bold transition ${rejectDisposition === 'FINAL' ? 'bg-white text-red-700 shadow-sm' : 'text-slate-600 hover:text-slate-900'}`}
+                                        onClick={() => setRejectDisposition('FINAL')}
+                                    >
+                                        Tolak Final
+                                    </button>
+                                </div>
+                            )}
+                            <textarea
+                                className="w-full border border-slate-300 rounded-xl p-3 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-red-400"
+                                rows={4}
+                                placeholder="Tulis alasan penolakan..."
+                                value={rejectNote}
+                                onChange={e => setRejectNote(e.target.value)}
+                                autoFocus
+                            />
+                            {rejectModal.tipe === 'RAB' && Array.isArray((rejectModal as NormalizedDetail).items) && (rejectModal as NormalizedDetail).items.length > 0 && (
+                                <div className="rounded-xl border border-red-100 bg-red-50/40 p-3 space-y-3">
+                                    <div>
+                                        <div className="flex items-center justify-between gap-3">
+                                            <div>
+                                                <p className="text-sm font-bold text-red-700">Detail Revisi RAB</p>
+                                                <p className="text-xs text-slate-600">Pilih item RAB yang perlu direvisi. Catatan ditulis langsung pada item terkait.</p>
+                                            </div>
+                                            <Button
+                                                type="button"
+                                                size="sm"
+                                                variant="outline"
+                                                className="h-8 border-red-200 text-red-700 hover:bg-red-50"
+                                                disabled={rejectRabRevisionItems.filter(item => typeof item.id === 'number').length >= (rejectModal as NormalizedDetail).items.length}
+                                                onClick={() => setRejectRabRevisionItems(prev => [...prev, { id: null, note: '' }])}
+                                            >
+                                                <Plus className="w-3.5 h-3.5 mr-1" /> Item
+                                            </Button>
+                                        </div>
+                                    </div>
+                                    {rejectRabRevisionItems.map((revision, index) => {
+                                        const selectedIdsInOtherRows = new Set(
+                                            rejectRabRevisionItems
+                                                .filter((_, itemIndex) => itemIndex !== index)
+                                                .map(item => item.id)
+                                                .filter((id): id is number => typeof id === 'number')
+                                        );
+                                        const isDuplicateSelection = typeof revision.id === 'number'
+                                            && rejectRabRevisionItems.findIndex(item => item.id === revision.id) !== index;
+                                        return (
+                                            <div key={index} className="rounded-lg border border-slate-200 bg-white p-3">
+                                                <div className="flex items-center justify-between mb-2">
+                                                    <span className="text-xs font-bold text-slate-700">Item Revisi #{index + 1}</span>
+                                                    <button
+                                                        type="button"
+                                                        className="text-xs font-semibold text-red-600 hover:text-red-700"
+                                                        onClick={() => setRejectRabRevisionItems(prev => prev.filter((_, itemIndex) => itemIndex !== index))}
+                                                    >
+                                                        Hapus
+                                                    </button>
+                                                </div>
+                                                <div className="grid grid-cols-1 md:grid-cols-[1.2fr_1fr] gap-2">
+                                                    <select
+                                                        className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-red-300"
+                                                        value={isDuplicateSelection ? '' : revision.id ?? ''}
+                                                        onChange={e => {
+                                                            const nextId = e.target.value ? Number(e.target.value) : null;
+                                                            if (nextId !== null && selectedIdsInOtherRows.has(nextId)) {
+                                                                showToast('Item revisi ini sudah dipilih.', 'error');
+                                                                return;
+                                                            }
+                                                            setRejectRabRevisionItems(prev => prev.map((item, itemIndex) => itemIndex === index ? { ...item, id: nextId } : item));
+                                                        }}
+                                                    >
+                                                        <option value="">Pilih item RAB...</option>
+                                                        {(rejectModal as NormalizedDetail).items.filter(item => {
+                                                            const itemId = Number(item.id);
+                                                            return itemId === revision.id || !selectedIdsInOtherRows.has(itemId);
+                                                        }).map(item => {
+                                                            const itemId = Number(item.id);
+                                                            return (
+                                                            <option
+                                                                key={item.id}
+                                                                value={itemId}
+                                                            >
+                                                                #{item.id} - {item.kategori} / {item.jenis_pekerjaan}
+                                                            </option>
+                                                        )})}
+                                                    </select>
+                                                    <input
+                                                        className="w-full border border-slate-300 rounded-lg px-3 py-2 text-xs focus:outline-none focus:ring-2 focus:ring-red-300"
+                                                        value={revision.note}
+                                                        onChange={e => setRejectRabRevisionItems(prev => prev.map((item, itemIndex) => itemIndex === index ? { ...item, note: e.target.value } : item))}
+                                                        placeholder="Catatan item..."
+                                                    />
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
+                            <div className="flex gap-3 pt-1">
+                                <Button variant="outline" className="flex-1" onClick={() => setRejectModal(null)} disabled={processingId === rejectModal?.id}>Batal</Button>
+                                <Button className="flex-1 bg-red-600 hover:bg-red-700 text-white" onClick={handleReject} disabled={processingId === rejectModal?.id}>
+                                    {processingId === rejectModal?.id
+                                        ? <><Loader2 className="w-4 h-4 mr-2 animate-spin" />Memproses...</>
+                                        : 'Konfirmasi Tolak'
+                                    }
+                                </Button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            <AppNavbar
+                title={selectedType ? APPROVAL_CONFIG[selectedType].label : 'Approval Dokumen'}
+                showBackButton
+                backHref="/dashboard"
+                rightActions={
+                    <div className="flex items-center gap-2">
+                        {approvalTotalCount > 0 && (
+                            <Badge className="bg-red-100 text-red-700 border-red-200 font-bold text-xs px-2.5">
+                                {approvalTotalCount} Proses
+                            </Badge>
+                        )}
+                        {selectedType && filteredList.length > 0 && activeView === 'list' && (
+                            <Badge className="bg-yellow-400 text-yellow-900 border-0 font-bold text-xs px-2.5">
+                                {filteredList.length} Item
+                            </Badge>
+                        )}
+                        <Badge variant="outline" className="bg-black/10 text-white border-white/30 px-3 py-1 md:py-1.5 shadow-sm backdrop-blur-sm text-xs font-medium hidden md:flex">
+                            {userInfo.role || 'LOADING...'}
+                        </Badge>
+                    </div>
+                }
+            />
+
+            <main className="max-w-350 mx-auto p-4 md:p-8 mt-4">
+
+                {/* ===== VIEW 0: MENU ===== */}
+                {activeView === 'menu' && (
+                    <div className="flex flex-col items-center mt-10 animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <div className="text-center mb-8">
+                            <h2 className="text-2xl font-extrabold text-slate-800">Approval Center</h2>
+                            <p className="text-slate-500 text-sm mt-1">Pilih jenis dokumen yang ingin Anda setujui</p>
+                        </div>
+                        <div className={`grid grid-cols-1 gap-6 w-full px-4 ${accessibleTypes.length === 1 ? 'max-w-sm' : accessibleTypes.length === 2 ? 'md:grid-cols-2 max-w-2xl' : 'md:grid-cols-3 max-w-3xl'}`}>
+                            {accessibleTypes.map(type => {
+                                const cfg = APPROVAL_CONFIG[type];
+                                const count = approvalCounts[type] ?? 0;
+                                return (
+                                    <Card
+                                        key={type}
+                                        className={`hover:shadow-lg cursor-pointer transition-all border-2 border-transparent ${cfg.hoverBorder} group relative overflow-hidden`}
+                                        onClick={() => handleSelectType(type)}
+                                    >
+                                        {count > 0 && (
+                                            <div className="absolute right-4 top-4 min-w-7 h-7 px-2 rounded-full bg-red-600 text-white text-xs font-extrabold flex items-center justify-center shadow-sm">
+                                                {count > 99 ? '99+' : count}
+                                            </div>
+                                        )}
+                                        <CardContent className="p-10 flex flex-col items-center text-center gap-4">
+                                            <div className={`${cfg.color} transition-transform group-hover:scale-110 duration-200`}>
+                                                {cfg.icon}
+                                            </div>
+                                            <div>
+                                                <h3 className="font-bold text-xl text-slate-800">{cfg.label}</h3>
+                                                <p className="text-sm text-slate-500 mt-1">{cfg.description}</p>
+                                            </div>
+                                            <div className="flex items-center gap-2">
+                                                <Badge className={`${cfg.badgeColor} text-xs font-medium border`}>{type}</Badge>
+                                                {isCountsLoading && (
+                                                    <Loader2 className="w-3.5 h-3.5 animate-spin text-slate-300" />
+                                                )}
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                );
+                            })}
+                        </div>
+                    </div>
+                )}
+
+                {/* ===== VIEW 1: LIST ===== */}
+                {activeView === 'list' && selectedType && (
+                    <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
+                        <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4">
+                            <div className="flex items-center gap-4">
+                                <Button variant="outline" className="h-10" onClick={handleBackToMenu}>
+                                    <ArrowLeft className="w-4 h-4 mr-2" /> Menu Utama
+                                </Button>
+                                <div>
+                                    <h2 className="text-2xl font-bold text-slate-800">{APPROVAL_CONFIG[selectedType].label}</h2>
+                                    <p className="text-sm text-slate-500">Daftar pengajuan yang memerlukan tindakan Anda</p>
+                                </div>
+                            </div>
+                            <div className="flex flex-col md:flex-row items-center gap-3 w-full md:w-auto">
+                                {showCabangFilter && cabangOptions.length > 0 && (
+                                    <div className="relative w-full md:w-48">
+                                        <Building2 className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                                        <select
+                                            value={cabangFilter}
+                                            onChange={e => setCabangFilter(e.target.value)}
+                                            className="w-full pl-9 pr-4 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-red-400 bg-white appearance-none cursor-pointer"
+                                        >
+                                            <option value="">{cabangFilterDefaultLabel}</option>
+                                            {cabangOptions.map(c => (
+                                                <option key={c} value={c}>{c}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                )}
+                                <div className="relative w-full md:w-64">
+                                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
+                                    <input
+                                        type="text"
+                                        placeholder="Cari toko / ULOK / email..."
+                                        className="w-full pl-9 pr-4 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-red-400 bg-white"
+                                        value={searchQuery}
+                                        onChange={e => setSearchQuery(e.target.value)}
+                                    />
+                                </div>
+                                <Button
+                                    variant="outline"
+                                    className="h-10 w-full md:w-auto shrink-0 bg-white"
+                                    onClick={() => loadList(selectedType)}
+                                    disabled={isLoading}
+                                >
+                                    <RefreshCw className={`w-4 h-4 mr-2 ${isLoading ? 'animate-spin' : ''}`} />
+                                    Refresh
+                                </Button>
+                            </div>
+                        </div>
+
+
+
+                        {isLoading ? (
+                            <div className="py-24 text-center text-slate-500">
+                                <Loader2 className="w-8 h-8 animate-spin mx-auto mb-2 text-red-500" />
+                                Memuat data...
+                            </div>
+                        ) : filteredList.length === 0 ? (
+                            <div className="py-20 text-center bg-white rounded-xl border border-slate-200 shadow-sm">
+                                <div className="text-5xl mb-3">📭</div>
+                                <h3 className="text-slate-500 font-medium">
+                                    {listData.length === 0 ? APPROVAL_CONFIG[selectedType].emptyMsg : 'Tidak ada data yang cocok dengan filter.'}
+                                </h3>
+                            </div>
+                        ) : (
+                            <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden">
+                                <div className="overflow-x-auto">
+                                    <table className="w-full text-sm text-left border-collapse">
+                                        <thead className="bg-slate-100 text-slate-700 border-b border-slate-200">
+                                            <tr>
+                                                <th className="p-3 border-r font-semibold">No. ULOK</th>
+                                                <th className="p-3 border-r font-semibold min-w-50">Nama Toko</th>
+                                                <th className="p-3 border-r font-semibold">Pengaju</th>
+                                                <th className="p-3 border-r font-semibold text-center whitespace-nowrap">Tgl Pengajuan</th>
+                                                {selectedType !== 'PROJECT_PLANNING' && (
+                                                    <th className="p-3 border-r font-semibold text-right">Total Nilai</th>
+                                                )}
+                                                <th className="p-3 border-r font-semibold text-center">Status</th>
+                                                <th className="p-3 font-semibold text-center">Aksi</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody className="divide-y divide-slate-100">
+                                            {filteredList.map(item => (
+                                                <tr
+                                                    key={item.id}
+                                                    className={`transition-colors ${isActionableByRole(item.status, item.tipe) ? 'hover:bg-yellow-50/40' : item.status.toUpperCase() === 'APPROVED' ? 'bg-green-50/20 hover:bg-green-50/40' : 'bg-red-50/20 hover:bg-red-50/40'}`}
+                                                >
+                                                    <td className="p-3 font-bold text-slate-700 border-r">{item.nomor_ulok}</td>
+                                                    <td className="p-3 border-r">
+                                                        <p className="font-semibold text-slate-800">{item.nama_toko}</p>
+                                                        <p className="text-xs text-slate-400 mt-0.5">{item.cabang}</p>
+                                                    </td>
+                                                    <td className="p-3 border-r text-slate-600 text-xs">{item.email_pembuat}</td>
+                                                    <td className="p-3 border-r text-center text-xs text-slate-600 whitespace-nowrap">{formatDate(item.created_at)}</td>
+                                                    {selectedType !== 'PROJECT_PLANNING' && (
+                                                        <td className="p-3 border-r text-right font-bold text-slate-800">{item.tipe === 'PERTAMBAHAN_SPK' ? `+${item.pertambahan_hari || '-'} Hari` : formatRupiah(item.total_nilai)}</td>
+                                                    )}
+                                                    <td className="p-3 border-r text-center"><ApprovalBadge status={item.status} /></td>
+                                                    <td className="p-3 text-center">
+                                                        <div className="flex items-center justify-center gap-1.5 flex-wrap">
+                                                            <Button
+                                                                size="sm"
+                                                                variant="outline"
+                                                                className="h-8 text-xs border-slate-300 text-slate-700 hover:bg-slate-50"
+                                                                onClick={() => loadDetail(item)}
+                                                            >
+                                                                <Eye className="w-3.5 h-3.5 mr-1" /> Detail
+                                                            </Button>
+                                                        </div>
+                                                    </td>
+                                                </tr>
+                                            ))}
+                                        </tbody>
+                                    </table>
+                                </div>
+                            </div>
+                        )}
+                    </div>
+                )}
+
+                {/* ===== VIEW 2: DETAIL ===== */}
+                {activeView === 'detail' && selectedType && (
+                    <div className="animate-in zoom-in-95 duration-300">
+
+                        {/* Nav atas */}
+                        <div className="flex justify-between items-center mb-6 flex-wrap gap-3">
+                            <Button variant="ghost" className="text-slate-500 hover:text-slate-800 px-0" onClick={handleBackToList}>
+                                <ArrowLeft className="w-4 h-4 mr-2" /> Kembali ke Daftar
+                            </Button>
+                            <div className="flex items-center gap-3 flex-wrap">
+                                {selectedDetail?.tipe === 'RAB' && (
+                                    <Button
+                                        variant="outline"
+                                        className="border-blue-600 text-blue-700 hover:bg-blue-50 font-bold"
+                                        disabled={processingId === `pdf-${selectedDetail.id}`}
+                                        onClick={() => handleDownloadPDF(selectedDetail.id as number, 'RAB')}
+                                    >
+                                        {processingId === `pdf-${selectedDetail.id}`
+                                            ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            : <FileDown className="w-4 h-4 mr-2" />
+                                        }
+                                        {processingId === `pdf-${selectedDetail.id}` ? 'Menyiapkan PDF...' : 'Download RAB (PDF)'}
+                                    </Button>
+                                )}
+                                {selectedDetail?.tipe === 'SPK' && (
+                                    <Button
+                                        variant="outline"
+                                        className="border-purple-600 text-purple-700 hover:bg-purple-50 font-bold"
+                                        disabled={processingId === `pdf-${selectedDetail.id}`}
+                                        onClick={() => handleDownloadPDF(selectedDetail.id as number, 'SPK')}
+                                    >
+                                        {processingId === `pdf-${selectedDetail.id}`
+                                            ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            : <FileDown className="w-4 h-4 mr-2" />
+                                        }
+                                        {processingId === `pdf-${selectedDetail.id}` ? 'Menyiapkan PDF...' : 'Download SPK (PDF)'}
+                                    </Button>
+                                )}
+                                {selectedDetail?.tipe === 'OPNAME' && (
+                                    <Button
+                                        variant="outline"
+                                        className="border-sky-600 text-sky-700 hover:bg-sky-50 font-bold"
+                                        disabled={processingId === `pdf-${selectedDetail.id}`}
+                                        onClick={() => handleDownloadPDF(selectedDetail.id as number, 'OPNAME')}
+                                    >
+                                        {processingId === `pdf-${selectedDetail.id}`
+                                            ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            : <FileDown className="w-4 h-4 mr-2" />
+                                        }
+                                        {processingId === `pdf-${selectedDetail.id}` ? 'Menyiapkan PDF...' : 'Download Opname (PDF)'}
+                                    </Button>
+                                )}
+                                {selectedDetail?.tipe === 'INSTRUKSI_LAPANGAN' && (
+                                    <Button
+                                        variant="outline"
+                                        className="border-amber-600 text-amber-700 hover:bg-amber-50 font-bold"
+                                        disabled={processingId === `pdf-${selectedDetail.id}`}
+                                        onClick={() => handleDownloadPDF(selectedDetail.id as number, 'INSTRUKSI_LAPANGAN')}
+                                    >
+                                        {processingId === `pdf-${selectedDetail.id}`
+                                            ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            : <FileDown className="w-4 h-4 mr-2" />
+                                        }
+                                        {processingId === `pdf-${selectedDetail.id}` ? 'Menyiapkan PDF...' : 'Download Instruksi Lapangan'}
+                                    </Button>
+                                )}
+                                {selectedDetail?.tipe === 'INTERVENSI' && selectedDetail.link_pdf_gabungan && (
+                                    <Button
+                                        variant="outline"
+                                        className="border-red-600 text-red-700 hover:bg-red-50 font-bold"
+                                        disabled={processingId === `pdf-${selectedDetail.id}`}
+                                        onClick={() => handleDownloadPDF(selectedDetail.id as number, 'INTERVENSI')}
+                                    >
+                                        {processingId === `pdf-${selectedDetail.id}`
+                                            ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            : <FileDown className="w-4 h-4 mr-2" />
+                                        }
+                                        {processingId === `pdf-${selectedDetail.id}` ? 'Menyiapkan PDF...' : 'Download BA Intervensi'}
+                                    </Button>
+                                )}
+                                {selectedDetail?.tipe === 'INTERVENSI' && (
+                                    <Button
+                                        variant="outline"
+                                        className="border-slate-300 text-slate-700 hover:bg-slate-50 font-bold"
+                                        disabled={processingId === `source-${selectedDetail.id}`}
+                                        onClick={() => handleDownloadIntervensiSource(selectedDetail)}
+                                    >
+                                        {processingId === `source-${selectedDetail.id}`
+                                            ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                            : <FileDown className="w-4 h-4 mr-2" />
+                                        }
+                                        Unduh Dokumen
+                                    </Button>
+                                )}
+                                {selectedDetail?.tipe === 'SURAT_PERINGATAN' && selectedDetail.link_pdf_gabungan && (
+                                    <a
+                                        href={selectedDetail.link_pdf_gabungan}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center justify-center h-10 px-4 py-2 border border-red-600 text-red-700 bg-transparent rounded-md text-sm font-bold hover:bg-red-50 transition-colors"
+                                    >
+                                        <FileDown className="w-4 h-4 mr-2" />
+                                        Download SP (PDF)
+                                    </a>
+                                )}
+                            </div>
+                        </div>
+
+                        {isDetailLoading ? (
+                            <div className="py-24 text-center text-slate-500">
+                                <Loader2 className="w-8 h-8 animate-spin mx-auto mb-2 text-red-500" />
+                                Memuat detail...
+                            </div>
+                        ) : selectedDetail ? (
+                            <>
+                                {/* Info Card */}
+                                <Card className="mb-6 shadow-sm border-slate-200 bg-slate-50">
+                                    <CardContent className="p-6 rounded-xl">
+                                        <div className="flex flex-col md:flex-row justify-between items-center gap-4">
+                                            <div className="flex-1 w-full">
+                                                <div className="flex items-center gap-3 mb-2 flex-wrap">
+                                                    <h2 className="text-xl font-bold text-slate-800">
+                                                        {selectedDetail.nama_toko === '-' && selectedDetail.tipe === 'SURAT_PERINGATAN' 
+                                                            ? `Surat Peringatan (${selectedDetail.nomor_ulok})` 
+                                                            : selectedDetail.nama_toko}
+                                                    </h2>
+                                                    <ApprovalBadge status={selectedDetail.status} />
+                                                    {selectedDetail.durasi && (
+                                                        <span className="inline-flex items-center rounded-md bg-white px-3 py-1 text-sm font-bold text-slate-700 ring-1 ring-inset ring-slate-200 shadow-sm whitespace-nowrap">
+                                                            {selectedDetail.durasi} hari
+                                                        </span>
+                                                    )}
+                                                </div>
+                                                {selectedDetail.alamat && (
+                                                    <p className="text-sm text-slate-500 mb-2">{selectedDetail.alamat}</p>
+                                                )}
+                                                <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-4 gap-4 mt-4">
+                                                    <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                        <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                            <Building2 className="w-3.5 h-3.5" /> ULOK
+                                                        </span>
+                                                        <span className="text-sm font-semibold text-slate-800 line-clamp-1" title={selectedDetail.nomor_ulok}>
+                                                            {selectedDetail.nomor_ulok}
+                                                        </span>
+                                                    </div>
+                                                    {selectedDetail.kode_toko && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                                <Building2 className="w-3.5 h-3.5" /> Kode Toko
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 line-clamp-1" title={selectedDetail.kode_toko}>
+                                                                {selectedDetail.kode_toko}
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    {selectedDetail.lingkup_pekerjaan && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                                <FileText className="w-3.5 h-3.5" /> Lingkup
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 line-clamp-1" title={selectedDetail.lingkup_pekerjaan}>
+                                                                {selectedDetail.lingkup_pekerjaan}
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                        <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                            <User className="w-3.5 h-3.5" /> Pengaju
+                                                        </span>
+                                                        <span className="text-sm font-semibold text-slate-800 line-clamp-1" title={selectedDetail.email_pembuat}>
+                                                            {selectedDetail.email_pembuat}
+                                                        </span>
+                                                    </div>
+                                                    <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                        <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                            <CalendarDays className="w-3.5 h-3.5" /> Tgl Pengajuan
+                                                        </span>
+                                                        <span className="text-sm font-semibold text-slate-800 line-clamp-1">
+                                                            {formatDate(selectedDetail.created_at)}
+                                                        </span>
+                                                    </div>
+                                                    {selectedDetail.nama_kontraktor && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                                <ClipboardList className="w-3.5 h-3.5" /> Kontraktor
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 line-clamp-1" title={selectedDetail.nama_kontraktor}>
+                                                                {selectedDetail.nama_kontraktor}
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    {selectedDetail.durasi && selectedDetail.tipe !== 'RAB' && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                                <CalendarDays className="w-3.5 h-3.5" /> Durasi
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 line-clamp-1">
+                                                                {selectedDetail.durasi} Hari
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    {selectedDetail.durasi && selectedDetail.tipe === 'RAB' && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                                <CalendarDays className="w-3.5 h-3.5" /> Durasi Pekerjaan
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 line-clamp-1">
+                                                                {selectedDetail.durasi} Hari
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    {selectedDetail.waktu_mulai && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                                <CalendarDays className="w-3.5 h-3.5" /> Tanggal Mulai
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 line-clamp-1">
+                                                                {formatDate(selectedDetail.waktu_mulai)}
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    {selectedDetail.waktu_selesai && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                                                                <CalendarDays className="w-3.5 h-3.5" /> Tanggal Selesai
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 line-clamp-1">
+                                                                {formatDate(selectedDetail.waktu_selesai)}
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                    {selectedDetail.st_target_date && (
+                                                        <div className="flex flex-col gap-1.5 p-3 bg-white rounded-lg border border-slate-100 shadow-sm">
+                                                            <span className="flex items-center gap-1.5 text-[10px] font-bold text-teal-600 uppercase tracking-wider">
+                                                                <CalendarDays className="w-3.5 h-3.5 text-teal-600" /> Target ST
+                                                            </span>
+                                                            <span className="text-sm font-semibold text-slate-800 flex items-center gap-2 line-clamp-1">
+                                                                {formatDate(selectedDetail.st_target_date)}
+                                                                {selectedDetail.st_offset_label && (
+                                                                    <span className="rounded bg-teal-50 px-1.5 py-0.5 text-[10px] font-bold text-teal-700">
+                                                                        {selectedDetail.st_offset_label}
+                                                                    </span>
+                                                                )}
+                                                            </span>
+                                                        </div>
+                                                    )}
+                                                </div>
+
+                                                {/* Alasan penolakan */}
+                                                {selectedDetail.alasan_penolakan && (
+                                                    <div className="mt-3 bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-800 flex gap-2">
+                                                        <XCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                                                        <span><b>Alasan Penolakan:</b> {selectedDetail.alasan_penolakan}</span>
+                                                    </div>
+                                                )}
+
+                                                {/* Riwayat approval */}
+                                                {!isRejected(selectedDetail.status) && (selectedDetail.approval_koordinator?.pemberi || selectedDetail.approval_manager?.pemberi || selectedDetail.approval_direktur?.pemberi) && (
+                                                    <div className="mt-4 pt-4 border-t border-slate-200 space-y-2">
+                                                        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-2">Riwayat Persetujuan</p>
+                                                        <ApprovalHistoryRow label="Koordinator" pemberi={selectedDetail.approval_koordinator?.pemberi} waktu={selectedDetail.approval_koordinator?.waktu} catatan={selectedDetail.approval_koordinator?.catatan} />
+                                                        <ApprovalHistoryRow label="Manager" pemberi={selectedDetail.approval_manager?.pemberi} waktu={selectedDetail.approval_manager?.waktu} catatan={selectedDetail.approval_manager?.catatan} />
+                                                        <ApprovalHistoryRow label="Direktur Kontraktor" pemberi={selectedDetail.approval_direktur?.pemberi} waktu={selectedDetail.approval_direktur?.waktu} catatan={selectedDetail.approval_direktur?.catatan} />
+                                                    </div>
+                                                )}
+                                            </div>
+
+                                            {/* Total / Pertambahan SPK summary */}
+                                            <div className="text-right shrink-0">
+                                                {selectedDetail.tipe === 'PERTAMBAHAN_SPK' ? (
+                                                    <>
+                                                        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Perpanjangan</p>
+                                                        <p className="text-3xl font-extrabold text-emerald-700">+{selectedDetail.pertambahan_hari} Hari</p>
+                                                    </>
+                                                ) : selectedDetail.tipe === 'SURAT_PERINGATAN' ? (
+                                                    <>
+                                                        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Total Denda</p>
+                                                        <p className="text-3xl font-extrabold text-red-700">{formatRupiah(selectedDetail.total_nilai)}</p>
+                                                        <p className="text-xs font-semibold text-red-500 mt-1">
+                                                            Durasi Denda: {selectedDetail.hari_denda ?? 0} hari
+                                                        </p>
+                                                    </>
+                                                ) : selectedDetail.tipe === 'INTERVENSI' ? (
+                                                    <>
+                                                        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Request</p>
+                                                        <p className="text-2xl font-extrabold text-red-700">Intervensi</p>
+                                                        <p className="text-xs font-semibold text-slate-500 mt-1">
+                                                            {REQUEST_INTERVENSI_LABELS[selectedDetail._raw?.jenis_intervensi as keyof typeof REQUEST_INTERVENSI_LABELS] || '-'}
+                                                        </p>
+                                                    </>
+                                                ) : selectedDetail.tipe !== 'PROJECT_PLANNING' ? (
+                                                    <>
+                                                        <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide">Total Nilai</p>
+                                                        <p className="text-3xl font-extrabold text-slate-800">{formatRupiah(selectedDetail.total_nilai)}</p>
+                                                        {selectedDetail.tipe === 'OPNAME' && (
+                                                            <p className="text-xs font-semibold text-red-500 mt-1">
+                                                                Denda {formatRupiah(parseCurrency(selectedDetail.nilai_denda))} ({selectedDetail.hari_denda ?? 0} hari)
+                                                            </p>
+                                                        )}
+                                                    </>
+                                                ) : (
+                                                    null
+                                                )}
+                                                <Badge className={`mt-2 ${APPROVAL_CONFIG[selectedDetail.tipe].badgeColor} font-medium border`}>
+                                                    {APPROVAL_CONFIG[selectedDetail.tipe].label}
+                                                </Badge>
+                                            </div>
+                                        </div>
+                                    </CardContent>
+                                </Card>
+
+                                {/* Informasi Tambahan - untuk RAB Manager Approval */}
+                                {selectedDetail.tipe === 'RAB' && jabatan === 'MANAGER' && (selectedDetail.beanspot_type || selectedDetail.is_hth !== null || selectedDetail.is_fasade !== null) && (
+                                    <Card className="mb-6 shadow-sm border-blue-200 bg-gradient-to-br from-blue-50 to-white">
+                                        <CardContent className="p-6">
+                                            <h3 className="font-bold text-blue-800 text-sm mb-4 flex items-center gap-2">
+                                                <ClipboardList className="w-4 h-4 text-blue-600" />
+                                                INFORMASI TAMBAHAN
+                                            </h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                                <div className="bg-white rounded-lg p-4 border border-blue-100 shadow-sm">
+                                                    <p className="text-[11px] font-bold text-blue-600 uppercase tracking-wider mb-2">Beanspot</p>
+                                                    <p className="text-base font-semibold text-slate-800">
+                                                        {selectedDetail.beanspot_type ? (
+                                                            selectedDetail.beanspot_type === 'TIDAK' ? 'Tidak' : 
+                                                            selectedDetail.beanspot_type === 'ADVANCE' ? 'Advance' :
+                                                            selectedDetail.beanspot_type === 'MEDIUM' ? 'Medium' :
+                                                            selectedDetail.beanspot_type === 'RTD_ONLY' ? 'RTD Only' :
+                                                            selectedDetail.beanspot_type
+                                                        ) : '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-white rounded-lg p-4 border border-blue-100 shadow-sm">
+                                                    <p className="text-[11px] font-bold text-blue-600 uppercase tracking-wider mb-2">HTH (Head to Head)</p>
+                                                    <p className="text-base font-semibold text-slate-800">
+                                                        {selectedDetail.is_hth === true ? (
+                                                            selectedDetail.hth_meter ? `Ya, ${selectedDetail.hth_meter} meter` : 'Ya'
+                                                        ) : selectedDetail.is_hth === false ? 'Tidak' : '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-white rounded-lg p-4 border border-blue-100 shadow-sm">
+                                                    <p className="text-[11px] font-bold text-blue-600 uppercase tracking-wider mb-2">Fasade</p>
+                                                    <p className="text-base font-semibold text-slate-800">
+                                                        {selectedDetail.is_fasade === true ? 'Ya' : selectedDetail.is_fasade === false ? 'Tidak' : '-'}
+                                                    </p>
+                                                </div>
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                )}
+
+                                {selectedDetail.tipe === 'INTERVENSI' && (
+                                    <Card className="mb-6 shadow-sm border-red-200 bg-white">
+                                        <CardContent className="p-6">
+                                            <h3 className="font-bold text-slate-700 text-sm mb-4 flex items-center gap-2">
+                                                <AlertTriangle className="w-4 h-4 text-red-600" />
+                                                Detail Request Intervensi
+                                            </h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Jenis Intervensi</p>
+                                                    <p className="text-sm font-semibold text-slate-800">
+                                                        {REQUEST_INTERVENSI_LABELS[selectedDetail._raw?.jenis_intervensi as keyof typeof REQUEST_INTERVENSI_LABELS] || '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nilai Saat Ini</p>
+                                                    <p className="text-sm font-semibold text-slate-800">
+                                                        {selectedDetail._raw?.tanggal_sebelum || selectedDetail._raw?.status_sumber_sebelum || '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Tujuan</p>
+                                                    <p className="text-sm font-semibold text-slate-800">
+                                                        {selectedDetail._raw?.target_tanggal || selectedDetail._raw?.target_status || '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nomor Request</p>
+                                                    <p className="text-sm font-semibold text-slate-800">{selectedDetail._raw?.nomor_request || '-'}</p>
+                                                </div>
+                                            </div>
+                                            <div className="mt-4 rounded-lg border border-slate-100 bg-slate-50 p-3">
+                                                <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Alasan</p>
+                                                <p className="text-sm text-slate-700 whitespace-pre-wrap">{selectedDetail._raw?.alasan || '-'}</p>
+                                            </div>
+                                            {selectedDetail.link_lampiran_pendukung && (
+                                                <button
+                                                    type="button"
+                                                    onClick={() => downloadRequestIntervensiLampiran(Number(selectedDetail.id)).catch((error) => showToast(error.message || 'Gagal mengunduh lampiran.', 'error'))}
+                                                    className="mt-4 inline-flex items-center text-sm font-bold text-red-700 hover:text-red-800"
+                                                >
+                                                    <FileDown className="w-4 h-4 mr-2" />
+                                                    Lampiran Pendukung
+                                                </button>
+                                            )}
+                                        </CardContent>
+                                    </Card>
+                                )}
+
+                                {/* Visualisasi Gantt Chart - untuk RAB & SPK */}
+                                {(selectedDetail.tipe === 'RAB' || selectedDetail.tipe === 'SPK') && selectedDetail.id_toko && (
+                                    <div className="mb-6">
+                                        <GanttViewer
+                                            nomorUlok={selectedDetail.nomor_ulok}
+                                            idToko={selectedDetail.id_toko}
+                                            title={selectedDetail.tipe === 'RAB' ? 'Visualisasi Gantt RAB' : 'Visualisasi Gantt SPK'}
+                                            isBelumSpk={selectedDetail.tipe === 'RAB'}
+                                            spkStartDate={selectedDetail.tipe === 'SPK' ? selectedDetail.waktu_mulai : undefined}
+                                            spkDuration={selectedDetail.tipe === 'SPK' ? selectedDetail.durasi : undefined}
+                                            hideLegend={true}
+                                        />
+                                    </div>
+                                )}
+
+                                {/* Pertambahan SPK Detail Card */}
+                                {selectedDetail.tipe === 'PERTAMBAHAN_SPK' && (
+                                    <Card className="mb-6 shadow-sm border-emerald-200 bg-white">
+                                        <CardContent className="p-6">
+                                            <h3 className="font-bold text-slate-700 text-sm mb-4 flex items-center gap-2">
+                                                <CalendarDays className="w-4 h-4 text-emerald-600" />
+                                                Detail Perpanjangan SPK
+                                            </h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                                                {!(selectedDetail.nomor_spk_sipil || selectedDetail.nomor_spk_me) && (
+                                                    <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nomor SPK</p>
+                                                        <p className="text-sm font-semibold text-slate-800">{selectedDetail.nomor_spk || '-'}</p>
+                                                    </div>
+                                                )}
+                                                {selectedDetail.nomor_spk_sipil && (
+                                                    <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nomor SPK (Sipil)</p>
+                                                        <p className="text-sm font-semibold text-slate-800">{selectedDetail.nomor_spk_sipil}</p>
+                                                    </div>
+                                                )}
+                                                {selectedDetail.nomor_spk_me && (
+                                                    <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                        <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nomor SPK (ME)</p>
+                                                        <p className="text-sm font-semibold text-slate-800">{selectedDetail.nomor_spk_me}</p>
+                                                    </div>
+                                                )}
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Pertambahan Hari</p>
+                                                    <p className="text-sm font-bold text-emerald-700">+{selectedDetail.pertambahan_hari} Hari</p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Durasi SPK Awal</p>
+                                                    <p className="text-sm font-semibold text-slate-800">{selectedDetail.durasi ? `${selectedDetail.durasi} Hari` : '-'}</p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Tgl Mulai SPK</p>
+                                                    <p className="text-sm font-semibold text-slate-800">{formatDate(selectedDetail.waktu_mulai || '')}</p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Tgl Akhir SPK (Sebelum)</p>
+                                                    <p className="text-sm font-semibold text-slate-800">{formatDate(selectedDetail.tanggal_spk_akhir || '')}</p>
+                                                </div>
+                                                <div className="bg-emerald-50 rounded-lg p-3 border border-emerald-200">
+                                                    <p className="text-[11px] font-bold text-emerald-600 uppercase tracking-wider mb-1">Tgl Akhir Setelah Perpanjangan</p>
+                                                    <p className="text-sm font-bold text-emerald-800">{formatDate(selectedDetail.tanggal_spk_akhir_setelah_perpanjangan || '')}</p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nilai Kontrak SPK</p>
+                                                    <p className="text-sm font-semibold text-slate-800">{formatRupiah(selectedDetail.total_nilai)}</p>
+                                                </div>
+                                            </div>
+                                            {/* Alasan Perpanjangan */}
+                                            <div className="mt-4 bg-amber-50 border border-amber-200 rounded-lg p-4">
+                                                <p className="text-[11px] font-bold text-amber-600 uppercase tracking-wider mb-1">Alasan Perpanjangan</p>
+                                                <p className="text-sm text-slate-800">{selectedDetail.alasan_perpanjangan || '-'}</p>
+                                            </div>
+                                            {/* Lampiran links */}
+                                            <div className="mt-4 flex flex-wrap gap-3">
+                                                {selectedDetail.link_pdf && (
+                                                    <button
+                                                        type="button"
+                                                        onClick={async () => {
+                                                            try {
+                                                                await downloadPertambahanSPKPdf(Number(selectedDetail.id));
+                                                            } catch (err: unknown) {
+                                                                const message = err instanceof Error ? err.message : 'Gagal mengunduh PDF perpanjangan.';
+                                                                showToast(message, 'error');
+                                                            }
+                                                        }}
+                                                        className="inline-flex items-center gap-2 px-4 py-2 bg-blue-50 text-blue-700 border border-blue-200 rounded-lg text-sm font-semibold hover:bg-blue-100 transition-colors"
+                                                    >
+                                                        <FileText className="w-4 h-4" />
+                                                        Lihat PDF Perpanjangan
+                                                    </button>
+                                                )}
+                                                {selectedDetail.link_lampiran_pendukung && (
+                                                    <a
+                                                        href={`${API_URL.replace(/\/$/, "")}/api/denda/actions/proxy-file?url=${encodeURIComponent(selectedDetail.link_lampiran_pendukung)}`}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-lg text-sm font-semibold hover:bg-emerald-100 transition-colors"
+                                                    >
+                                                        <FileDown className="w-4 h-4" />
+                                                        Lihat Lampiran Pendukung
+                                                    </a>
+                                                )}
+                                            </div>
+                                        </CardContent>
+                                    </Card>
+                                )}
+
+                                {/* Surat Peringatan Detail Card */}
+                                {selectedDetail.tipe === 'SURAT_PERINGATAN' && (
+                                    <Card className="mb-6 shadow-sm border-red-200 bg-white">
+                                        <CardContent className="p-6">
+                                            <h3 className="font-bold text-slate-700 text-sm mb-4 flex items-center gap-2">
+                                                <AlertTriangle className="w-4 h-4 text-red-600" />
+                                                Detail Surat Peringatan
+                                            </h3>
+                                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Status SP</p>
+                                                    <p className="text-sm font-semibold text-slate-800">
+                                                        {{
+                                                            'WAITING_MANAGER': 'Menunggu Approval Manager',
+                                                            'APPROVED_BY_MANAGER': 'Disetujui Manager',
+                                                            'REJECTED_BY_MANAGER': 'Ditolak Manager',
+                                                            'SENT_TO_CONTRACTOR': 'Terkirim ke Kontraktor',
+                                                            'VIEWED_BY_CONTRACTOR': 'Dilihat oleh Kontraktor',
+                                                            'ACKNOWLEDGED_BY_CONTRACTOR': 'Disetujui Kontraktor'
+                                                        }[selectedDetail._raw?.status as string] || selectedDetail._raw?.status || '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nama Toko</p>
+                                                    <p className="text-sm font-semibold text-slate-800">{selectedDetail._raw?.nama_toko || '-'}</p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Tanggal SPK</p>
+                                                    <p className="text-sm font-semibold text-slate-800">
+                                                        {(selectedDetail._raw?.tanggal_spk || selectedDetail._raw?.tanggal_spk_selesai)
+                                                            ? `${formatDate(selectedDetail._raw?.tanggal_spk)} s/d ${formatDate(selectedDetail._raw?.tanggal_spk_selesai)}`
+                                                            : '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Nilai SPK</p>
+                                                    <p className="text-sm font-semibold text-slate-800">
+                                                        {selectedDetail._raw?.nilai_spk ? formatRupiah(Number(selectedDetail._raw.nilai_spk)) : '-'}
+                                                    </p>
+                                                </div>
+                                                <div className="bg-slate-50 rounded-lg p-3 border border-slate-100 md:col-span-2">
+                                                    <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider mb-1">Alasan SP</p>
+                                                    <p className="text-sm font-bold text-red-700">
+                                                        {selectedDetail._raw?.alasan_sp || '-'}
+                                                        {selectedDetail._raw?.alasan_lainnya ? ` - ${selectedDetail._raw.alasan_lainnya}` : ''}
+                                                    </p>
+                                                    {selectedDetail._raw?.catatan && (
+                                                        <div className="mt-3 rounded-md border border-red-100 bg-white px-3 py-2 text-sm text-slate-800 whitespace-pre-wrap">
+                                                            {selectedDetail._raw.catatan}
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            </div>
+                                            {/* Lampiran links */}
+                                            {selectedDetail.link_lampiran_pendukung && (
+                                                <div className="mt-4 flex flex-wrap gap-3">
+                                                    <a
+                                                        href={`${API_URL.replace(/\/$/, "")}/api/denda/actions/proxy-file?url=${encodeURIComponent(selectedDetail.link_lampiran_pendukung)}`}
+                                                        target="_blank"
+                                                        rel="noopener noreferrer"
+                                                        className="inline-flex items-center gap-2 px-4 py-2 bg-slate-100 text-slate-700 border border-slate-300 rounded-lg text-sm font-semibold hover:bg-slate-200 transition-colors"
+                                                    >
+                                                        <FileDown className="w-4 h-4" />
+                                                        Lihat Lampiran Pendukung
+                                                    </a>
+                                                </div>
+                                            )}
+                                        </CardContent>
+                                    </Card>
+                                )}
+
+                                {/* Tabel Rincian */}
+                                {selectedDetail.items && selectedDetail.items.length > 0 ? (
+                                    <div className="bg-white rounded-xl shadow-sm border border-slate-200 overflow-hidden mb-6">
+                                        <div className="flex items-center justify-between px-5 py-3 bg-slate-50 border-b border-slate-200">
+                                            <h3 className="font-bold text-slate-700 text-sm">Rincian Pekerjaan</h3>
+                                            <span className="text-xs text-slate-400">{selectedDetail.items.length} item</span>
+                                        </div>
+                                        <div className="overflow-x-auto">
+                                            <table className="w-full text-sm text-left border-collapse">
+                                                <thead className="bg-slate-100 text-slate-700 border-b">
+                                                    <tr>
+                                                        <th className="p-3 border-r font-semibold text-center whitespace-nowrap">Kategori</th>
+                                                        <th className="p-3 border-r font-semibold min-w-62.5 text-center whitespace-nowrap">Jenis Pekerjaan</th>
+                                                        {selectedDetail.tipe !== 'INSTRUKSI_LAPANGAN' && selectedDetail.tipe !== 'RAB' && (
+                                                            <th className="p-3 border-r font-semibold text-center whitespace-nowrap">Dokumentasi</th>
+                                                        )}
+                                                        <th className="p-3 border-r font-semibold min-w-48 text-center">Catatan</th>
+                                                        <th className="p-3 border-r font-semibold text-center whitespace-nowrap">Volume</th>
+                                                        <th className="p-3 border-r font-semibold text-center whitespace-nowrap">Satuan</th>
+                                                        <th className="p-3 border-r font-semibold text-center whitespace-nowrap">Harga Material</th>
+                                                        <th className="p-3 border-r font-semibold text-center whitespace-nowrap">Harga Upah</th>
+                                                        <th className="p-3 font-semibold text-center whitespace-nowrap">Total</th>
+                                                    </tr>
+                                                </thead>
+                                                <tbody className="divide-y divide-slate-100">
+                                                    {selectedDetail.items.map(row => (
+                                                        <tr key={row.id} className="hover:bg-slate-50">
+                                                            <td className="p-3 font-semibold text-slate-600 border-r text-xs whitespace-nowrap">{row.kategori}</td>
+                                                            <td className="p-3 text-slate-700 border-r whitespace-normal min-w-62.5">{row.jenis_pekerjaan}</td>
+                                                            {selectedDetail.tipe !== 'INSTRUKSI_LAPANGAN' && selectedDetail.tipe !== 'RAB' && (
+                                                                <td className="p-3 text-center border-r">
+                                                                    {row.foto ? (
+                                                                        <a href={row.foto} target="_blank" rel="noopener noreferrer">
+                                                                            <Button
+                                                                                size="sm"
+                                                                                variant="outline"
+                                                                                className="h-8 text-xs border-indigo-200 text-indigo-700 hover:bg-indigo-50"
+                                                                            >
+                                                                                <Eye className="w-3.5 h-3.5 mr-1" />
+                                                                                Lihat Foto
+                                                                            </Button>
+                                                                        </a>
+                                                                    ) : (
+                                                                        <span className="text-xs text-slate-400">Tidak ada foto</span>
+                                                                    )}
+                                                                </td>
+                                                            )}
+                                                            <td className="p-3 text-slate-500 italic text-xs border-r">{row.catatan || '-'}</td>
+                                                            <td className="p-3 text-center font-bold border-r whitespace-nowrap">{row.volume}</td>
+                                                            <td className="p-3 text-center text-slate-500 border-r whitespace-nowrap">{row.satuan}</td>
+                                                            <td className="p-3 text-right font-medium text-slate-700 border-r whitespace-nowrap">{formatRupiah(row.harga_material || 0)}</td>
+                                                            <td className="p-3 text-right font-medium text-slate-700 border-r whitespace-nowrap">{formatRupiah(row.harga_upah || 0)}</td>
+                                                            <td className="p-3 text-right font-bold text-slate-800 whitespace-nowrap">{formatRupiah(row.total || 0)}</td>
+                                                        </tr>
+                                                    ))}
+                                                </tbody>
+                                                <tfoot className="border-t border-slate-300">
+                                                    {/* Baris GRAND TOTAL item mentah */}
+                                                    <tr className="bg-slate-100">
+                                                        <td colSpan={selectedDetail.tipe === 'INSTRUKSI_LAPANGAN' ? 7 : selectedDetail.tipe === 'RAB' ? 7 : 8} className="p-3 font-bold text-slate-700 text-right">GRAND TOTAL</td>
+                                                        <td className="p-3 font-extrabold text-slate-800 text-right whitespace-nowrap">
+                                                            {formatRupiah(selectedDetail.items.reduce((s, r) => s + Number(r.total ?? 0), 0))}
+                                                        </td>
+                                                    </tr>
+                                                    {/* Breakdown transparan kalkulasi hanya untuk RAB */}
+                                                    {selectedDetail.tipe === 'RAB' && (() => {
+                                                        const rawTotal = selectedDetail.items.reduce((s, r) => s + Number(r.total ?? 0), 0);
+                                                        const pembulatan = Math.floor(rawTotal / 10000) * 10000;
+                                                        const isNoPpn = ['BATAM', 'BINTAN'].includes((selectedDetail.cabang ?? '').toUpperCase());
+                                                        const ppn = isNoPpn ? 0 : Math.round(pembulatan * 0.11);
+                                                        const grandTotalFinal = pembulatan + ppn;
+                                                        const selisihPembulatan = pembulatan - rawTotal;
+                                                        return (
+                                                            <>
+                                                                <tr className="bg-amber-50 border-t border-amber-200">
+                                                                    <td colSpan={8} className="px-4 pt-3 pb-0">
+                                                                        <div className="flex items-center gap-2 mb-2">
+                                                                            <div className="w-4 h-0.5 bg-amber-400 rounded-full"></div>
+                                                                            <span className="text-xs font-bold text-amber-700 uppercase tracking-wide">Rincian Kalkulasi Total Nilai</span>
+                                                                            <div className="flex-1 h-0.5 bg-amber-200 rounded-full"></div>
+                                                                        </div>
+                                                                    </td>
+                                                                </tr>
+                                                                <tr className="bg-amber-50">
+                                                                    <td colSpan={7} className="px-6 py-1.5 text-right text-sm text-slate-600">Total Estimasi Pekerjaan :</td>
+                                                                    <td className="px-4 py-1.5 text-right text-sm font-semibold text-slate-700 whitespace-nowrap">{formatRupiah(rawTotal)}</td>
+                                                                </tr>
+                                                                <tr className="bg-amber-50">
+                                                                    <td colSpan={7} className="px-6 py-1.5 text-right text-sm text-slate-600">
+                                                                        Pembulatan ke kelipatan Rp10.000 :
+                                                                        <span className="ml-1 text-xs text-slate-400">(dibulatkan ke bawah)</span>
+                                                                    </td>
+                                                                    <td className="px-4 py-1.5 text-right text-sm font-semibold whitespace-nowrap">
+                                                                        <span className={selisihPembulatan < 0 ? 'text-red-600' : 'text-slate-700'}>{formatRupiah(pembulatan)}</span>
+                                                                        {selisihPembulatan !== 0 && (
+                                                                            <span className="block text-xs text-slate-400 font-normal">
+                                                                                ({formatRupiah(selisihPembulatan)} dari estimasi)
+                                                                            </span>
+                                                                        )}
+                                                                    </td>
+                                                                </tr>
+                                                                {isNoPpn ? (
+                                                                    <tr className="bg-amber-50">
+                                                                        <td colSpan={7} className="px-6 py-1.5 text-right text-sm text-slate-500 italic">PPN : <span className="text-emerald-600 font-semibold not-italic">Bebas PPN (Batam/Bintan)</span></td>
+                                                                        <td className="px-4 py-1.5 text-right text-sm font-semibold text-emerald-600">Rp 0</td>
+                                                                    </tr>
+                                                                ) : (
+                                                                    <tr className="bg-amber-50">
+                                                                        <td colSpan={7} className="px-6 py-1.5 text-right text-sm text-slate-600">PPN 11% :</td>
+                                                                        <td className="px-4 py-1.5 text-right text-sm font-semibold text-slate-700 whitespace-nowrap">{formatRupiah(ppn)}</td>
+                                                                    </tr>
+                                                                )}
+                                                                <tr className="bg-amber-100 border-t-2 border-amber-300">
+                                                                    <td colSpan={7} className="px-6 py-3 text-right font-extrabold text-amber-900 text-base">TOTAL NILAI AKHIR</td>
+                                                                    <td className="px-4 py-3 text-right font-extrabold text-amber-900 text-base whitespace-nowrap">
+                                                                        {formatRupiah(grandTotalFinal)}
+                                                                        {grandTotalFinal !== selectedDetail.total_nilai && (
+                                                                            <span className="block text-xs font-normal text-slate-500 mt-0.5">
+                                                                                (DB: {formatRupiah(selectedDetail.total_nilai)})
+                                                                            </span>
+                                                                        )}
+                                                                    </td>
+                                                                </tr>
+                                                            </>
+                                                        );
+                                                    })()}
+                                                </tfoot>
+                                            </table>
+                                        </div>
+                                    </div>
+                                ) : selectedDetail.tipe !== 'SPK' && selectedDetail.tipe !== 'PERTAMBAHAN_SPK' && selectedDetail.tipe !== 'SURAT_PERINGATAN' ? (
+                                    <div className="py-10 text-center bg-white rounded-xl border border-slate-200 text-slate-400 text-sm mb-6">
+                                        Tidak ada rincian item
+                                    </div>
+                                ) : null}
+
+                                {/* Sticky bottom bar */}
+                                {canActOnDetail && detailAsListItem && !approveModal && !rejectModal && (
+                                    <div className="sticky bottom-6 flex justify-center z-50">
+                                        <div className="bg-white border border-slate-200 rounded-2xl shadow-xl px-6 py-4 flex items-center gap-4 animate-in slide-in-from-bottom-2 duration-300">
+                                            <span className="text-sm text-slate-600 font-medium hidden md:block">Ambil tindakan pada pengajuan ini:</span>
+                                            <Button
+                                                variant="outline"
+                                                className="border-red-200 text-red-600 hover:bg-red-50 font-bold px-6"
+                                                disabled={!!processingId}
+                                                onClick={() => openRejectModal(selectedDetail)}
+                                            >
+                                                <XCircle className="w-4 h-4 mr-2" /> Tolak
+                                            </Button>
+                                            <Button
+                                                className="bg-green-600 hover:bg-green-700 text-white font-bold px-8"
+                                                disabled={!!processingId}
+                                                onClick={() => openApproveModal(selectedDetail)}
+                                            >
+                                                {processingId === selectedDetail.id
+                                                    ? <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+                                                    : <CheckCircle className="w-4 h-4 mr-2" />
+                                                }
+                                                Approve
+                                            </Button>
+
+                                        </div>
+                                    </div>
+                                )}
+                            </>
+                        ) : null}
+                    </div>
+                )}
+
+            </main>
+        </div>
+    );
+}
+
+export default function ApprovalPage() {
+    return (
+        <React.Suspense fallback={<div className="flex h-screen items-center justify-center bg-slate-50"><Loader2 className="h-8 w-8 animate-spin text-slate-400" /></div>}>
+            <ApprovalPageContent />
+        </React.Suspense>
+    );
+}
